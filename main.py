@@ -80,6 +80,8 @@ MAX_LIVE = env_int("MAX_LIVE_DEVICES", 20)
 MAX_ROWS = env_int("MAX_REPORT_ROWS", 500)
 BALANCE_THRESHOLD = float(os.getenv("BALANCE_THRESHOLD", "2500"))
 DB_PATH = os.getenv("DB_PATH", "./era_x_scanner.sqlite3")
+FIREBASE_READ_TIMEOUT = env_int("FIREBASE_READ_TIMEOUT", 30)
+FIREBASE_MAX_RESPONSE_BYTES = env_int("FIREBASE_MAX_RESPONSE_BYTES", 25 * 1024 * 1024)
 scan_lock = asyncio.Lock()
 firebase_ready = False
 
@@ -592,19 +594,38 @@ async def public_firebase_read(path: str) -> Any:
 
     def fetch() -> Any:
         try:
-            with urllib.request.urlopen(url, timeout=20) as response:
-                return json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(url, timeout=FIREBASE_READ_TIMEOUT) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > FIREBASE_MAX_RESPONSE_BYTES:
+                    raise RuntimeError(
+                        f"Firebase response is too large ({content_length} bytes; "
+                        f"limit is {FIREBASE_MAX_RESPONSE_BYTES} bytes)"
+                    )
+                raw = response.read(FIREBASE_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > FIREBASE_MAX_RESPONSE_BYTES:
+                    raise RuntimeError(
+                        f"Firebase response exceeded the {FIREBASE_MAX_RESPONSE_BYTES}-byte limit"
+                    )
+                return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 raise RuntimeError("Firebase public read is denied by the database rules") from exc
             raise RuntimeError(f"Firebase returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError(f"Firebase connection/read timeout or network error: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Firebase returned non-JSON data") from exc
 
-    return await asyncio.to_thread(fetch)
+    return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=FIREBASE_READ_TIMEOUT)
 
 
 async def firebase_read(path: str) -> Any:
+    # A URL explicitly supplied through Telegram must be the source of truth.
+    # Credentials remain available as the fallback for the configured URL.
+    if store.get("firebase_url"):
+        log.info("Starting public Firebase read: path=%s", path or "/")
+        return await public_firebase_read(path)
+
     has_service_account = bool(
         os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
         or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
@@ -614,7 +635,11 @@ async def firebase_read(path: str) -> Any:
     init_firebase()
     for attempt in range(3):
         try:
-            return await asyncio.to_thread(lambda: db.reference(path or "/").get())
+            log.info("Starting Firebase Admin SDK read: path=%s attempt=%d", path or "/", attempt + 1)
+            return await asyncio.wait_for(
+                asyncio.to_thread(lambda: db.reference(path or "/").get()),
+                timeout=FIREBASE_READ_TIMEOUT,
+            )
         except Exception:
             if attempt == 2:
                 raise
@@ -837,12 +862,24 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
     async with scan_lock:
         sid = store.start(path)
         try:
+            started_at = time.monotonic()
+            log.info("Scan started: path=%s", path)
             snapshot = await firebase_read(path)
-            records = scan_device_snapshot(snapshot, path)
+            log.info("Firebase read completed: path=%s type=%s", path, type(snapshot).__name__)
+            records = await asyncio.to_thread(scan_device_snapshot, snapshot, path)
             store.finish(sid, records, "completed")
+            log.info(
+                "Scan completed: path=%s records=%d elapsed=%.2fs",
+                path,
+                len(records),
+                time.monotonic() - started_at,
+            )
+            await message.reply_text(
+                f"Firebase read successful. Found {len(records)} record(s); sending the report now."
+            )
             await reply_report(message, format_report(records, mode), with_buttons)
         except Exception as e:
-            log.exception("scan failed")
+            log.exception("scan failed: path=%s", path)
             store.finish(sid, [], "failed", str(e))
             await message.reply_text(f"Scan failed: {esc(e)}")
 
