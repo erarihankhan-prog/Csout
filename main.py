@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from dotenv import load_dotenv
 from firebase_admin import credentials, db
@@ -82,8 +82,11 @@ BALANCE_THRESHOLD = float(os.getenv("BALANCE_THRESHOLD", "2500"))
 DB_PATH = os.getenv("DB_PATH", "./era_x_scanner.sqlite3")
 FIREBASE_READ_TIMEOUT = env_int("FIREBASE_READ_TIMEOUT", 120)
 FIREBASE_MAX_RESPONSE_BYTES = env_int("FIREBASE_MAX_RESPONSE_BYTES", 256 * 1024 * 1024)
+FIREBASE_PAGE_SIZE = env_int("FIREBASE_PAGE_SIZE", 250)
 scan_lock = asyncio.Lock()
 firebase_ready = False
+active_scan_task: asyncio.Task | None = None
+scan_cancel_event: asyncio.Event | None = None
 
 ALIASES = {
     "device": ("deviceId", "device_id", "androidId", "installationId"),
@@ -107,6 +110,7 @@ IDENTITY_KEYS = {x for values in ALIASES.values() for x in values} - {"status", 
 # ---------------------------------------------------------------------------
 
 BANK_SENDER_MAP = [
+    (re.compile(r"BOBSMS|BOB(?:BANK)?|BANKOF BARODA|BARODA", re.I), "Bank of Baroda"),
     (re.compile(r"HDFCBK|HDFCBANK|HDFC", re.I), "HDFC Bank"),
     (re.compile(r"SBIIN|SBIINB|SBI", re.I), "SBI"),
     (re.compile(r"ICICIB|ICICI", re.I), "ICICI Bank"),
@@ -160,7 +164,10 @@ def detect_bank(sender: str) -> str:
     for pattern, name in BANK_SENDER_MAP:
         if pattern.search(sender or ""):
             return name
-    return "Bank"
+    # Do not hide an operational sender behind the generic "Bank" label.
+    # Unknown bank codes remain visible until a more specific mapping is added.
+    sender_name = re.sub(r"\s+", " ", str(sender or "")).strip()
+    return sender_name or "Bank"
 
 
 def parse_sms_balance(text: str, sender: str = "") -> dict[str, Any] | None:
@@ -477,7 +484,13 @@ class Store:
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, started TEXT, finished TEXT, path TEXT, status TEXT, error TEXT, summary TEXT, records TEXT);
+        CREATE TABLE IF NOT EXISTS sources (source_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active', added_at TEXT NOT NULL);
         """)
+        for client_id in self.clients():
+            self.db.execute(
+                "INSERT OR IGNORE INTO sources(source_id,status,added_at) VALUES(?,?,?)",
+                (client_id, "active", datetime.now(timezone.utc).isoformat()),
+            )
         self.db.commit()
 
     def get(self, key: str, default: str = "") -> str:
@@ -499,6 +512,14 @@ class Store:
         before = len(old)
         old.update(x for x in vals if x)
         self.set(key, ",".join(sorted(old)))
+        if key == "allowed_clients":
+            for source_id in vals:
+                if source_id:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO sources(source_id,status,added_at) VALUES(?,?,?)",
+                        (source_id, "active", datetime.now(timezone.utc).isoformat()),
+                    )
+            self.db.commit()
         return len(old) - before
 
     def remove(self, key: str, val: str) -> bool:
@@ -506,7 +527,20 @@ class Store:
         existed = val in old
         old.discard(val)
         self.set(key, ",".join(sorted(old)))
+        if key == "allowed_clients":
+            self.db.execute("DELETE FROM sources WHERE source_id=?", (val,))
+            self.db.commit()
         return existed
+
+    def sources(self, query: str = "") -> list[sqlite3.Row]:
+        like = f"%{query.strip()}%"
+        return self.db.execute(
+            "SELECT source_id,status,added_at FROM sources WHERE source_id LIKE ? ORDER BY added_at DESC",
+            (like,),
+        ).fetchall()
+
+    def source(self, source_id: str) -> sqlite3.Row | None:
+        return self.db.execute("SELECT source_id,status,added_at FROM sources WHERE source_id=?", (source_id,)).fetchone()
 
     def start(self, path: str) -> int:
         cur = self.db.execute("INSERT INTO scans(started,path,status) VALUES(?,?,?)", (now(), path, "running"))
@@ -577,7 +611,7 @@ def init_firebase() -> None:
     firebase_ready = True
 
 
-def public_firebase_url(path: str) -> str:
+def public_firebase_url(path: str, query: dict[str, Any] | None = None) -> str:
     base = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/")
     if not base:
         raise RuntimeError("Configure a Firebase URL with /firebase <URL> first")
@@ -586,11 +620,12 @@ def public_firebase_url(path: str) -> str:
     if parsed.scheme != "https" or not (host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")):
         raise RuntimeError("Only an https Firebase Realtime Database URL is allowed")
     suffix = "" if path in {"", "/"} else "/" + path.strip("/")
-    return f"{base}/.json" if not suffix else f"{base}{suffix}.json"
+    url = f"{base}/.json" if not suffix else f"{base}{suffix}.json"
+    return f"{url}?{urlencode(query)}" if query else url
 
 
-async def public_firebase_read(path: str) -> Any:
-    url = public_firebase_url(path)
+async def public_firebase_read(path: str, query: dict[str, Any] | None = None) -> Any:
+    url = public_firebase_url(path, query)
 
     def fetch() -> Any:
         try:
@@ -617,6 +652,56 @@ async def public_firebase_read(path: str) -> Any:
             raise RuntimeError("Firebase returned non-JSON data") from exc
 
     return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=FIREBASE_READ_TIMEOUT)
+
+
+async def firebase_read_paginated(path: str, progress: Any = None, cancel_event: asyncio.Event | None = None) -> Any:
+    """Read a Realtime Database node in bounded REST pages.
+
+    Firebase's REST API uses inclusive startAt pagination, so the first item of
+    every page after page one is skipped. Pages are merged only after each
+    bounded request completes; no unbounded urllib read is allowed.
+    """
+    if not store.get("firebase_url"):
+        return await firebase_read(path)
+    merged: dict[str, Any] = {}
+    cursor: str | None = None
+    page_no = 0
+    while True:
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+        query: dict[str, Any] = {
+            "orderBy": '"$key"',
+            "limitToFirst": FIREBASE_PAGE_SIZE,
+        }
+        if cursor is not None:
+            query["startAt"] = json.dumps(cursor)
+        for attempt in range(3):
+            try:
+                page = await public_firebase_read(path, query)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                log.exception("Firebase page read failed; retrying page=%d attempt=%d", page_no + 1, attempt + 2)
+                await asyncio.sleep(2 ** attempt)
+        page_no += 1
+        if not isinstance(page, dict):
+            if page_no == 1:
+                return page
+            raise RuntimeError(f"Firebase page {page_no} returned {type(page).__name__}, expected an object")
+        items = list(page.items())
+        if cursor is not None and items and items[0][0] == cursor:
+            items = items[1:]
+        for key, value in items:
+            merged[key] = value
+        if progress:
+            await progress(f"Firebase page {page_no} read ({len(items)} new item(s))")
+        if len(page) < FIREBASE_PAGE_SIZE:
+            break
+        if not items:
+            raise RuntimeError(f"Firebase pagination made no progress at key {cursor!r}")
+        cursor = items[-1][0]
+    return merged
 
 
 async def firebase_read(path: str) -> Any:
@@ -753,6 +838,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addsender ID1 ID2\n"
         "/removesender ID\n"
         "/listsenders\n"
+        "/sources [search] — source management\n"
+        "/removesource SOURCE_ID — remove with confirmation\n"
+        "/cancel — cancel running scan\n"
+        "/retry — retry the last failed scan\n"
         "/status\n\n"
         f"Note: Only devices with parsed Available Balance ≥ ₹{int(BALANCE_THRESHOLD)} are shown."
     )
@@ -788,7 +877,7 @@ async def firebase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     store.set("firebase_url", value.rstrip("/"))
     await update.effective_message.reply_text("Firebase URL saved. Reading the root data now …")
-    await run_scan(update.effective_message, ROOT_PATH, "all", True)
+    await start_scan(update.effective_message, ROOT_PATH, "online", True)
 
 
 @admin_only
@@ -800,7 +889,7 @@ async def firebase_url_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app"):
             store.set("firebase_url", value.rstrip("/"))
             await update.effective_message.reply_text("Firebase URL saved. Reading the root data now …")
-            await run_scan(update.effective_message, ROOT_PATH, "all", True)
+            await start_scan(update.effective_message, ROOT_PATH, "online", True)
 
 
 @admin_only
@@ -847,6 +936,79 @@ async def listsenders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def source_panel_text(query: str = "") -> str:
+    rows = store.sources(query)
+    all_rows = store.sources()
+    active = sum(row["status"] == "active" for row in all_rows)
+    inactive = len(all_rows) - active
+    out = [
+        "<b>✦ SOURCE MANAGEMENT ✦</b>",
+        f"Total Sources: <b>{len(all_rows)}</b> | Active: <b>{active}</b> | Inactive: <b>{inactive}</b>",
+        f"Search: <code>{esc(query or '(all)')}</code>",
+        "",
+    ]
+    if not rows:
+        out.append("No authorized sources found.")
+    for row in rows:
+        out.append(f"<b>{esc(row['source_id'])}</b> | Status: {esc(row['status'])} | Added: {esc(row['added_at'])}")
+    return "\n".join(out)
+
+
+def source_keyboard(query: str = "") -> InlineKeyboardMarkup:
+    buttons = []
+    for row in store.sources(query)[:20]:
+        buttons.append([InlineKeyboardButton(f"Remove {row['source_id'][:30]}", callback_data=f"source:remove:{row['source_id']}")])
+    buttons.append([InlineKeyboardButton("Refresh", callback_data="source:refresh")])
+    return InlineKeyboardMarkup(buttons)
+
+
+@admin_only
+async def sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip() if context.args else ""
+    await update.effective_message.reply_text(
+        source_panel_text(query), parse_mode=ParseMode.HTML, reply_markup=source_keyboard(query)
+    )
+
+
+@admin_only
+async def removesource(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /removesource SOURCE_ID")
+        return
+    source_id = context.args[0]
+    row = store.source(source_id)
+    if not row:
+        await update.effective_message.reply_text("Source not found.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm remove", callback_data=f"source:confirm:{source_id}"),
+        InlineKeyboardButton("Cancel", callback_data="source:cancel"),
+    ]])
+    await update.effective_message.reply_text(
+        f"Confirm removal of source <code>{esc(source_id)}</code>? Other sources will not be affected.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@admin_only
+async def cancel_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not active_scan_task or active_scan_task.done() or not scan_cancel_event:
+        await update.effective_message.reply_text("No scan is currently running.")
+        return
+    scan_cancel_event.set()
+    await update.effective_message.reply_text("Cancellation requested. The current Firebase request will stop at its timeout boundary.")
+
+
+@admin_only
+async def retry_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = store.latest()
+    if not row or row["status"] not in {"failed", "cancelled"}:
+        await update.effective_message.reply_text("No failed or cancelled scan is available to retry.")
+        return
+    await start_scan(update.effective_message, row["path"], "online", True)
+
+
 @admin_only
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if scan_lock.locked():
@@ -855,17 +1017,48 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = context.args[0] if context.args else ROOT_PATH
     path = path if path.startswith("/") else "/" + path
     await update.effective_message.reply_text(f"Starting fresh scan at {path} …")
-    await run_scan(update.effective_message, path, "all", True)
+    await start_scan(update.effective_message, path, "online", True)
 
 
-async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: bool = True) -> None:
+async def start_scan(message: Any, path: str, mode: str = "all", with_buttons: bool = True) -> None:
+    global active_scan_task, scan_cancel_event
+    if active_scan_task and not active_scan_task.done():
+        await message.reply_text("A scan is already running. Use /cancel to stop it.")
+        return
+    scan_cancel_event = asyncio.Event()
+    active_scan_task = asyncio.create_task(run_scan(message, path, mode, with_buttons, scan_cancel_event))
+    await message.reply_text("Scan started in background. Progress updates will appear here; other commands remain available.")
+
+
+async def run_scan(
+    message: Any,
+    path: str,
+    mode: str = "all",
+    with_buttons: bool = True,
+    cancel_event: asyncio.Event | None = None,
+) -> None:
     async with scan_lock:
         sid = store.start(path)
         try:
             started_at = time.monotonic()
             log.info("Scan started: path=%s", path)
-            snapshot = await firebase_read(path)
+            last_progress_at = 0.0
+
+            async def progress(text: str) -> None:
+                nonlocal last_progress_at
+                log.info("scan progress: %s", text)
+                now_mono = time.monotonic()
+                important = "complete" in text.lower() or "processing" in text.lower()
+                if important or now_mono - last_progress_at >= 5:
+                    await message.reply_text(text)
+                    last_progress_at = now_mono
+
+            await progress(f"Reading Firebase in pages of {FIREBASE_PAGE_SIZE} items from {path} …")
+            snapshot = await firebase_read_paginated(path, progress, cancel_event)
             log.info("Firebase read completed: path=%s type=%s", path, type(snapshot).__name__)
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError()
+            await progress("Firebase read complete. Processing records without blocking Telegram …")
             records = await asyncio.to_thread(scan_device_snapshot, snapshot, path)
             store.finish(sid, records, "completed")
             log.info(
@@ -878,10 +1071,13 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
                 f"Firebase read successful. Found {len(records)} record(s); sending the report now."
             )
             await reply_report(message, format_report(records, mode), with_buttons)
+        except asyncio.CancelledError:
+            store.finish(sid, [], "cancelled", "Scan cancelled by admin")
+            await message.reply_text("Scan cancelled. No partial report was published.")
         except Exception as e:
             log.exception("scan failed: path=%s", path)
             store.finish(sid, [], "failed", str(e))
-            await message.reply_text(f"Scan failed: {esc(e)}")
+            await message.reply_text(f"Scan failed: {esc(type(e).__name__)}: {esc(e)}")
 
 
 @admin_only
@@ -891,7 +1087,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = (query.data or "report:all").split(":", 1)[-1]
     if mode == "refresh":
         await query.message.reply_text("Refreshing Firebase data …")
-        await run_scan(query.message, ROOT_PATH, "all", True)
+        await start_scan(query.message, ROOT_PATH, "online", True)
         return
     row = store.latest()
     if not row or row["status"] != "completed":
@@ -899,6 +1095,48 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     records = [Record(**item) for item in json.loads(row["records"] or "[]")]
     await reply_report(query.message, format_report(records, mode), True)
+
+
+@admin_only
+async def source_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = (query.data or "").split(":", 2)
+    action = parts[1] if len(parts) > 1 else "refresh"
+    if action == "cancel":
+        await query.edit_message_text("Source removal cancelled.")
+        return
+    if action == "refresh":
+        await query.edit_message_text(
+            source_panel_text(), parse_mode=ParseMode.HTML, reply_markup=source_keyboard()
+        )
+        return
+    if len(parts) < 3:
+        await query.edit_message_text("Invalid source action.")
+        return
+    source_id = parts[2]
+    if action == "remove":
+        if not store.source(source_id):
+            await query.edit_message_text("Source no longer exists.")
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Confirm remove", callback_data=f"source:confirm:{source_id}"),
+            InlineKeyboardButton("Cancel", callback_data="source:cancel"),
+        ]])
+        await query.edit_message_text(
+            f"Confirm removal of source <code>{esc(source_id)}</code>?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+    if action == "confirm":
+        removed = store.remove("allowed_clients", source_id)
+        await query.edit_message_text(
+            ("Source removed.\n\n" if removed else "Source was already absent.\n\n")
+            + source_panel_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=source_keyboard(),
+        )
 
 
 @admin_only
@@ -968,6 +1206,10 @@ def build_application() -> Application:
         "addsender": addsender,
         "removesender": removesender,
         "listsenders": listsenders,
+        "sources": sources,
+        "removesource": removesource,
+        "cancel": cancel_scan,
+        "retry": retry_scan,
         "scan": scan,
         "status": status,
         "report": report,
@@ -975,6 +1217,7 @@ def build_application() -> Application:
     }.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report:"))
+    app.add_handler(CallbackQueryHandler(source_callback, pattern=r"^source:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, firebase_url_message))
     return app
 
