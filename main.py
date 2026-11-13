@@ -881,23 +881,41 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan(update.effective_message, path, "all", True)
 
 
-async def _fetch_messages_for_ids(client_ids: list[str], concurrency: int = 8) -> dict[str, Any]:
-    """Fetch messages/{id} for each client in parallel (Panel-style, works on large DBs)."""
+# Cap how many message trees we pull per scan (prevents hang on huge DBs like 300+ devices)
+MAX_MESSAGE_FETCH = env_int("MAX_MESSAGE_FETCH", 120, minimum=10)
+
+
+async def _fetch_messages_for_ids(
+    client_ids: list[str],
+    concurrency: int = 6,
+    progress_cb=None,
+) -> dict[str, Any]:
+    """Fetch messages/{id} in small parallel batches. Never hangs forever."""
     out: dict[str, Any] = {}
     sem = asyncio.Semaphore(concurrency)
+    done = 0
+    total = len(client_ids)
 
     async def one(cid: str) -> None:
+        nonlocal done
         async with sem:
             try:
-                node = await firebase_read(f"messages/{cid}")
+                # short timeout so one slow device cannot block the whole scan
+                node = await asyncio.wait_for(firebase_read(f"messages/{cid}"), timeout=12)
                 if node is not None:
                     out[cid] = node
             except Exception as exc:
                 log.debug("messages/%s failed: %s", cid, exc)
+            finally:
+                done += 1
+                if progress_cb and done % 20 == 0:
+                    try:
+                        await progress_cb(done, total)
+                    except Exception:
+                        pass
 
-    # process in chunks so we don't open thousands of tasks at once
-    for i in range(0, len(client_ids), concurrency * 4):
-        batch = client_ids[i : i + concurrency * 4]
+    for i in range(0, len(client_ids), concurrency * 3):
+        batch = client_ids[i : i + concurrency * 3]
         await asyncio.gather(*(one(cid) for cid in batch))
     return out
 
@@ -906,37 +924,80 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
     async with scan_lock:
         sid = store.start(path)
         try:
-            # 1) Load root / clients+devices (avoid depending on giant messages blob)
-            snapshot = await firebase_read(path)
-            if not isinstance(snapshot, dict):
-                snapshot = {}
+            # IMPORTANT: do NOT download full root (messages blob is huge and hangs).
+            # Load clients + devices only, then pull messages per-device like the panel.
+            clients: dict[str, Any] = {}
+            devices: dict[str, Any] = {}
 
-            clients = snapshot.get("clients") if isinstance(snapshot.get("clients"), dict) else {}
-            devices = snapshot.get("devices") if isinstance(snapshot.get("devices"), dict) else {}
-            # If path was / we might already have messages; if too big it may be missing/truncated
-            existing_messages = snapshot.get("messages") if isinstance(snapshot.get("messages"), dict) else {}
+            await message.reply_text("Loading clients …")
+            try:
+                c = await asyncio.wait_for(firebase_read("clients"), timeout=30)
+                if isinstance(c, dict):
+                    clients = c
+            except Exception as exc:
+                log.warning("clients read failed: %s", exc)
 
+            try:
+                d = await asyncio.wait_for(firebase_read("devices"), timeout=20)
+                if isinstance(d, dict):
+                    devices = d
+            except Exception as exc:
+                log.debug("devices read failed/absent: %s", exc)
+
+            # If custom path was given and clients empty, try that path once (non-root preferred)
+            if not clients and not devices and path not in ("", "/"):
+                try:
+                    snap = await asyncio.wait_for(firebase_read(path), timeout=40)
+                    if isinstance(snap, dict):
+                        if isinstance(snap.get("clients"), dict):
+                            clients = snap["clients"]
+                        if isinstance(snap.get("devices"), dict):
+                            devices = snap["devices"]
+                        # only use inline messages if already small
+                        if isinstance(snap.get("messages"), dict) and len(snap["messages"]) <= 30:
+                            # rare small DB case
+                            pass
+                except Exception as exc:
+                    log.warning("path read failed: %s", exc)
+
+            snapshot: dict[str, Any] = {"clients": clients, "devices": devices}
             client_ids = sorted(set(clients) | set(devices))
-            if not client_ids and not existing_messages:
-                # fallback: try clients path alone
-                clients_only = await firebase_read("clients")
-                if isinstance(clients_only, dict):
-                    clients = clients_only
-                    snapshot["clients"] = clients
-                    client_ids = sorted(clients.keys())
 
-            # 2) If messages not already present (or only partial), fetch per-device like the panel
-            messages_map: dict[str, Any] = dict(existing_messages) if existing_messages else {}
-            need_fetch = [cid for cid in client_ids if cid not in messages_map]
-            if need_fetch:
-                await message.reply_text(
-                    f"Found {len(client_ids)} devices. Fetching SMS for {len(need_fetch)} devices …"
+            if not client_ids:
+                raise RuntimeError(
+                    "No clients/devices found. Check Firebase URL and that rules allow public read on /clients."
                 )
-                fetched = await _fetch_messages_for_ids(need_fetch, concurrency=10)
-                messages_map.update(fetched)
 
-            records = scan_device_snapshot(snapshot, path, messages_override=messages_map)
+            # Prefer online devices first for message fetch, then the rest (capped)
+            def _is_online_id(cid: str) -> bool:
+                node = devices.get(cid) if isinstance(devices.get(cid), dict) else clients.get(cid)
+                if not isinstance(node, dict):
+                    return False
+                return online_value_from_dict(node) == "online"
+
+            online_ids = [cid for cid in client_ids if _is_online_id(cid)]
+            offline_ids = [cid for cid in client_ids if cid not in set(online_ids)]
+            prioritized = online_ids + offline_ids
+            to_fetch = prioritized[:MAX_MESSAGE_FETCH]
+
+            await message.reply_text(
+                f"Devices: {len(client_ids)} (online≈{len(online_ids)}). "
+                f"Fetching SMS for {len(to_fetch)} devices (cap {MAX_MESSAGE_FETCH}) …"
+            )
+
+            async def progress(done: int, total: int) -> None:
+                if done in {20, 40, 60, 80, 100} or done == total:
+                    await message.reply_text(f"SMS progress: {done}/{total} …")
+
+            messages_map = await _fetch_messages_for_ids(to_fetch, concurrency=6, progress_cb=progress)
+
+            records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
             store.finish(sid, records, "completed")
+
+            with_bal = sum(1 for r in records if r.available_balance >= BALANCE_THRESHOLD)
+            await message.reply_text(
+                f"Scan done. Parsed balances ≥ ₹{int(BALANCE_THRESHOLD)}: {with_bal} / {len(records)} devices."
+            )
             await reply_report(message, format_report(records, mode), with_buttons)
         except Exception as e:
             log.exception("scan failed")
