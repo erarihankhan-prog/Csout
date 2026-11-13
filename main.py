@@ -548,6 +548,15 @@ def scan_device_snapshot(snapshot: Any, root: str = "/", messages_override: dict
     return sorted(records, key=lambda r: r.identity.lower())
 
 
+# Default sender IDs used for Match YES/NO (editable via /addsender /removesender)
+DEFAULT_SENDER_IDS = (
+    "JK-GROWWO-S",
+    "VM-GROWWO-S",
+    "CP-GROWWO-S",
+    "AD-GROWWO-S",
+)
+
+
 class Store:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -558,6 +567,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, started TEXT, finished TEXT, path TEXT, status TEXT, error TEXT, summary TEXT, records TEXT);
         """)
         self.db.commit()
+        # Seed default GROWWO senders only when list is empty (user can still remove/add anytime)
+        if not self.get("sender_ids").strip():
+            self.set("sender_ids", ",".join(DEFAULT_SENDER_IDS))
 
     def get(self, key: str, default: str = "") -> str:
         r = self.db.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
@@ -582,9 +594,16 @@ class Store:
 
     def remove(self, key: str, val: str) -> bool:
         old = {x for x in self.get(key).split(",") if x}
-        existed = val in old
-        old.discard(val)
-        self.set(key, ",".join(sorted(old)))
+        # case-insensitive remove for convenience
+        target = val.strip()
+        existed = False
+        keep = set()
+        for x in old:
+            if x.lower() == target.lower():
+                existed = True
+            else:
+                keep.add(x)
+        self.set(key, ",".join(sorted(keep)))
         return existed
 
     def start(self, path: str) -> int:
@@ -712,6 +731,14 @@ def selected(records: list[Record]) -> list[Record]:
     return rs
 
 
+def _sender_match(record_senders: tuple[str, ...] | list[str], allowed: set[str]) -> bool:
+    """Case-insensitive match against configured sender list (GROWWO etc.)."""
+    if not allowed:
+        return False
+    allowed_l = {x.lower() for x in allowed}
+    return any((s or "").lower() in allowed_l for s in record_senders)
+
+
 def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     rs = selected(records)
     allowed_senders = store.senders()
@@ -720,15 +747,14 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     rs = [r for r in rs if r.available_balance >= BALANCE_THRESHOLD]
 
     if mode == "matched":
-        shown = [r for r in rs if allowed_senders and set(r.sender_ids) & allowed_senders]
+        shown = [r for r in rs if _sender_match(r.sender_ids, allowed_senders)]
     elif mode == "no_match":
-        shown = [r for r in rs if not allowed_senders or not (set(r.sender_ids) & allowed_senders)]
+        shown = [r for r in rs if not _sender_match(r.sender_ids, allowed_senders)]
     elif mode == "online_no_match":
         # Default: ONLINE only + Sender Match NO only
         shown = [
             r for r in rs
-            if r.online == "online"
-            and (not allowed_senders or not (set(r.sender_ids) & allowed_senders))
+            if r.online == "online" and not _sender_match(r.sender_ids, allowed_senders)
         ]
     elif mode == "online":
         shown = [r for r in rs if r.online == "online"]
@@ -758,7 +784,7 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
             + ")."
         )
     for i, r in enumerate(shown[:MAX_ROWS], 1):
-        matched = bool(allowed_senders and set(r.sender_ids) & allowed_senders)
+        matched = _sender_match(r.sender_ids, allowed_senders)
         bal_line = f"₹{r.available_balance:,.2f}" if r.available_balance else "—"
         bank_line = r.bank_name or "—"
         acct = f"••{r.account_last4}" if r.account_last4 else "—"
