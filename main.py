@@ -104,20 +104,43 @@ IDENTITY_KEYS = {x for values in ALIASES.values() for x in values} - {"status", 
 # Balance parser (ported from ERA X Panel e1 / Gu / Xu logic)
 # ---------------------------------------------------------------------------
 
+# Same bank map as ERA X Panel (ph) + a few extra common DLT headers
 BANK_SENDER_MAP = [
-    (re.compile(r"HDFCBK|HDFCBANK|HDFC", re.I), "HDFC Bank"),
-    (re.compile(r"SBIIN|SBIINB|SBI", re.I), "SBI"),
-    (re.compile(r"ICICIB|ICICI", re.I), "ICICI Bank"),
-    (re.compile(r"AXISBK|AXISBANK|AXIS", re.I), "Axis Bank"),
-    (re.compile(r"KOTAKB|KOTAK", re.I), "Kotak Bank"),
-    (re.compile(r"PNBSMS|PNB", re.I), "PNB"),
-    (re.compile(r"BOIIND|BOI", re.I), "Bank of India"),
+    (re.compile(r"HDFCBK|HDFCBANK|\bHDFC\b", re.I), "HDFC Bank"),
+    (re.compile(r"SBIINB|SBIIN|\bSBI\b|State\s*Bank", re.I), "SBI"),
+    (re.compile(r"ICICIB|\bICICI\b", re.I), "ICICI Bank"),
+    (re.compile(r"AXISBK|AXISBANK|\bAXIS\b", re.I), "Axis Bank"),
+    (re.compile(r"KOTAKB|\bKOTAK\b", re.I), "Kotak Bank"),
+    (re.compile(r"PNBSMS|\bPNB\b|Punjab\s*National", re.I), "PNB"),
+    (re.compile(r"BOIIND|\bBOI\b|Bank\s*of\s*India", re.I), "Bank of India"),
     (re.compile(r"CANBNK|CANARA", re.I), "Canara Bank"),
-    (re.compile(r"UNIONB|UBISMS", re.I), "Union Bank"),
-    (re.compile(r"YESBNK|YESBANK", re.I), "Yes Bank"),
-    (re.compile(r"IDBIBK|IDBI", re.I), "IDBI Bank"),
+    (re.compile(r"UNIONB|UBISMS|Union\s*Bank", re.I), "Union Bank"),
+    (re.compile(r"YESBNK|YESBANK|\bYES\b", re.I), "Yes Bank"),
+    (re.compile(r"IDBIBK|\bIDBI\b", re.I), "IDBI Bank"),
     (re.compile(r"INDUSB|INDUSIND", re.I), "IndusInd Bank"),
     (re.compile(r"FEDERAL|FEDBNK", re.I), "Federal Bank"),
+    (re.compile(r"RBLBNK|\bRBL\b", re.I), "RBL Bank"),
+    (re.compile(r"BANDHAN", re.I), "Bandhan Bank"),
+    (re.compile(r"IOBCHN|\bIOB\b|Indian\s*Overseas", re.I), "IOB"),
+    (re.compile(r"CBIINB|\bCBI\b|Central\s*Bank", re.I), "Central Bank"),
+    (re.compile(r"MAHABK|Bank\s*of\s*Maharashtra|\bBOM\b", re.I), "Bank of Maharashtra"),
+    (re.compile(r"UCOBNK|\bUCO\b", re.I), "UCO Bank"),
+    (re.compile(r"INDBNK|Indian\s*Bank", re.I), "Indian Bank"),
+    (re.compile(r"PSBHO|\bPSB\b|Punjab\s*&\s*Sind", re.I), "PSB"),
+    (re.compile(r"KVBNK|Karur\s*Vysya|\bKVB\b", re.I), "KVB"),
+    (re.compile(r"TMBLNK|Tamilnad\s*Mercantile|\bTMB\b", re.I), "TMB"),
+    (re.compile(r"CSBBNK|\bCSB\b", re.I), "CSB Bank"),
+    (re.compile(r"DBSBNK|\bDBS\b", re.I), "DBS Bank"),
+    (re.compile(r"SCBLIN|Standard\s*Chartered|\bSCB\b", re.I), "Standard Chartered"),
+    (re.compile(r"HSBCIN|\bHSBC\b", re.I), "HSBC"),
+    (re.compile(r"CITIBN|\bCITI\b", re.I), "Citi Bank"),
+    (re.compile(r"PAYTMB|PAYTM", re.I), "Paytm"),
+    (re.compile(r"PHONEPE|PHNPE", re.I), "PhonePe"),
+    (re.compile(r"GPAY|GOOGLEPAY|Google\s*Pay", re.I), "Google Pay"),
+    (re.compile(r"AMAZONPAY|AMZPAY", re.I), "Amazon Pay"),
+    (re.compile(r"BAJAJFIN|BAJAJF", re.I), "Bajaj Finance"),
+    (re.compile(r"AIRTELP|AIRTEL\s*PAY", re.I), "Airtel Payments"),
+    (re.compile(r"JIOMNY|JIOMONEY", re.I), "Jio Money"),
 ]
 
 # Regexes for Available Balance (same order/priority as panel Vp)
@@ -160,10 +183,24 @@ KEYWORD_RE = re.compile(
 )
 
 
-def detect_bank(sender: str) -> str:
+def detect_bank(sender: str = "", text: str = "") -> str:
+    """Panel-style bank name: map → SMS body → sender code → Bank."""
+    blob = f"{sender or ''} {text or ''}"
     for pattern, name in BANK_SENDER_MAP:
-        if pattern.search(sender or ""):
+        if pattern.search(blob):
             return name
+    # Panel Xp fallback: pull readable token from DLT sender like VK-SBIINB-S / BG-PNBSMS-S
+    if sender:
+        m = re.search(r"(?:[A-Z]{2}[-_])?([A-Z][A-Z0-9]{2,})", sender.upper())
+        if m:
+            token = m.group(1)
+            # skip pure noise tokens
+            if token not in {"SMS", "MSG", "INFO", "ALERT", "OTP", "TXN", "UPI"}:
+                for pattern, name in BANK_SENDER_MAP:
+                    if pattern.search(token):
+                        return name
+                # show cleaned sender brand instead of plain "Bank"
+                return token[:24]
     return "Bank"
 
 
@@ -217,7 +254,7 @@ def parse_sms_balance(text: str, sender: str = "") -> dict[str, Any] | None:
                 break
 
     return {
-        "bankName": detect_bank(sender),
+        "bankName": detect_bank(sender, text),
         "senderName": sender or "Unknown",
         "availableBalance": available,
         "transactionAmount": txn_amount,
